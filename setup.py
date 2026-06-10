@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import os
+import sys
 
 from setuptools import setup
 
 
+_METADATA_COMMANDS = {"egg_info", "dist_info", "sdist"}
+
+
+def _metadata_only_command() -> bool:
+    return any(arg in _METADATA_COMMANDS for arg in sys.argv[1:])
+
+
 def _cuda_extensions():
+    if _metadata_only_command():
+        return [], {}
     mode = os.environ.get("ARENO_BUILD_EXT", "1").lower()
     if mode in {"0", "false", "no", "off"}:
         return [], {}
