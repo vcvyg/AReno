@@ -191,8 +191,7 @@ areno train \
   --tp-size 4
 ```
 
-`--ckpt` and `--dataset-path` accept either local paths or Hugging Face repo
-IDs. Switch algorithms by changing `--algo` (e.g. `--algo grpo`, `--algo sft`).
+`--ckpt` and `--dataset-path` accept either local paths or Hugging Face repo IDs. Switch algorithms by changing `--algo` (e.g. `--algo grpo`, `--algo sft`).
 
 Serve a trained checkpoint behind an OpenAI-compatible endpoint:
 
@@ -210,8 +209,7 @@ This starts a server with continuous batching; point any OpenAI client at
 
 ## Development
 
-If you want to contribute to AReno or customize it for your own needs, read
-the contribution guide and make a development install:
+If you want to contribute to AReno or customize it for your own needs, read the [contribution guide](CONTRIBUTING.md) and make a development install:
 
 ```bash
 git clone https://github.com/inclusionAI/asystem-areno.git
@@ -219,9 +217,7 @@ cd asystem-areno
 pip install -e . --no-build-isolation
 ```
 
-New algorithms, model adapters, kernels, reward functions, and hardware
-backends all have first-class extension points, so most contributions land
-without forking the core.
+New algorithms, model adapters, kernels, reward functions, and hardware backends all have first-class extension points, so most contributions land without forking the core.
 
 ## Citation
 
