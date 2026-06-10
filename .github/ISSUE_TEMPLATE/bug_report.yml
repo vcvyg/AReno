@@ -1,0 +1,84 @@
+name: 🐛 Bug report
+description: Report a bug in AReno itself (not your own code)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report! Before submitting,
+        please **search the [issue tracker](https://github.com/inclusionAI/asystem-areno/issues)**
+        to make sure the bug was not already reported.
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Prerequisites
+      description: Please confirm the following before submitting.
+      options:
+        - label: I have searched the issue tracker and this bug has not been reported yet.
+          required: true
+        - label: The bug is in AReno itself, not in my own code.
+          required: true
+        - label: I can reproduce it with an official install (not a heavily modified environment).
+          required: true
+        - label: I can consistently reproduce the bug across multiple trials or seeds.
+          required: false
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: A short, self-contained snippet that reproduces the bug.
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      description: The exact command you ran (`areno train ...` / `areno serve ...`) and the relevant flags.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Full traceback
+      description: The *full* traceback if an exception is raised.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Your **OS**, **Python**, **CUDA**, **PyTorch**, and **AReno** versions, plus GPU model.
+      value: |
+        - OS:
+        - Python:
+        - CUDA:
+        - PyTorch:
+        - AReno:
+        - GPU model:
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Any other context (logs, screenshots) you think may help.
+    validations:
+      required: false

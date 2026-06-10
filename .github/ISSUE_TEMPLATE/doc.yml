@@ -1,0 +1,40 @@
+name: 📝 Documentation
+description: Report incorrect, missing, or confusing documentation
+labels: ["documentation"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of the documentation issue.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: issue-type
+    attributes:
+      label: Issue type
+      description: Check all that apply.
+      options:
+        - label: Missing documentation
+        - label: Incorrect information
+        - label: Unclear or confusing
+        - label: Typo or formatting error
+        - label: Dead link
+        - label: Other
+
+  - type: input
+    id: location
+    attributes:
+      label: Location
+      description: Which file or page? (e.g. `README.md`, `docs/sdk/trainer.md`, or a URL)
+    validations:
+      required: false
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested fix
+      description: What should the documentation say or include instead?
+    validations:
+      required: false

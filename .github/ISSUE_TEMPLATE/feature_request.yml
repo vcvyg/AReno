@@ -1,0 +1,43 @@
+name: 🚀 Feature request
+description: Suggest a new feature or enhancement for AReno
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! For a new post-training **algorithm**,
+        please also skim the
+        [contribution guide](https://github.com/inclusionAI/asystem-areno/blob/main/CONTRIBUTING.md#do-you-want-to-implement-a-new-algorithm)
+        first — good candidates favor simplicity or single-node efficiency.
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: What problem does it solve, or what need does it address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed feature
+      description: Describe the feature in as much detail as possible, ideally with a code snippet showing how it would be used.
+    validations:
+      required: true
+
+  - type: input
+    id: paper
+    attributes:
+      label: Reference
+      description: A link to the paper, if the feature comes from one.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any alternative solutions or workarounds you have considered.
+    validations:
+      required: false

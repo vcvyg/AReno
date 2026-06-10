@@ -1,0 +1,44 @@
+name: ❓ Question
+description: Ask a question about using AReno
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have a usage question? Please first skim the
+        [README](https://github.com/inclusionAI/asystem-areno/blob/main/README.md)
+        and the [docs](https://github.com/inclusionAI/asystem-areno/tree/main/docs),
+        and search existing issues — your question may already be answered.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Clearly describe your question here.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      description: Which area does your question relate to?
+      options:
+        - Algorithm
+        - Training (SFT / RL)
+        - Serving / inference
+        - Model adapter
+        - Installation / build
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add any code, config, or commands that help explain your question.
+      render: shell
+    validations:
+      required: false
