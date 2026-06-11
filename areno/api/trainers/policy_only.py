@@ -274,13 +274,13 @@ class PolicyOnlyTrainer:
             token_row = agent_batch.token_rows[logged]
             first_loss_idx = next((idx for idx, enabled in enumerate(loss_mask) if enabled), -1)
             self.logger.info(
-                "epoch=%d step=%d prompt_idx=%d sample_idx=%d prompt=%r rendered_completion=%r final_answer=%r tool_calls=%s tool_results=%s loss_mask_true=%d/%d first_loss_idx=%d loss_mask=%s tokens=%s",
+                "epoch=%d step=%d prompt_idx=%d sample_idx=%d prompt=%r messages=%s final_answer=%r tool_calls=%s tool_results=%s loss_mask_true=%d/%d first_loss_idx=%d loss_mask=%s tokens=%s",
                 epoch,
                 step,
                 prompt_idx,
                 sample_idx,
                 record.prompt,
-                record.rendered_completion,
+                record.messages,
                 record.final_answer,
                 record.tool_calls,
                 record.tool_results[:4],

@@ -330,6 +330,7 @@ def test_agentic_multi_turn_calls_merge_into_one_training_sample():
     assert record.tokens == [10, 11, 20]
     assert record.tool_results == [{"name": None, "tool_call_id": None, "content": "tool result"}]
     assert record.completion == "10 11\n20"
+    assert record.final_answer == "20"
     assert [event.type for event in record.trace].count("request") == 2
     assert record.source_record == {"task": "multi"}
 
@@ -568,6 +569,7 @@ def _sample(item, text, tokens):
         item=item,
         messages=[],
         response_text=text,
+        last_response_text=text,
         response_tokens=tokens,
         response_logprobs=[0.0] * len(tokens),
         trace=[],

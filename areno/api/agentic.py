@@ -145,6 +145,7 @@ class _AgentSample:
     item: AgentItem
     messages: list[dict[str, Any]]
     response_text: str
+    last_response_text: str
     response_tokens: list[int]
     response_logprobs: list[float]
     trace: list[RewardEvent]
@@ -399,7 +400,7 @@ class RolloutSession:
     def _reward_record(self, sample: _AgentSample) -> RewardRecord:
         answer = sample.item.record.get("answer", sample.item.record.get("solutions"))
         messages = list(sample.messages)
-        messages.append({"role": "assistant", "content": sample.response_text})
+        messages.append({"role": "assistant", "content": sample.last_response_text})
         tool_calls = [
             {"name": event.name, "arguments": event.arguments}
             for event in sample.trace
@@ -412,7 +413,7 @@ class RolloutSession:
             prompt=sample.item.prompt,
             completion=sample.response_text,
             rendered_completion=rendered_completion,
-            final_answer=sample.response_text,
+            final_answer=sample.last_response_text,
             answer=answer,
             messages=messages,
             trace=sample.trace,
@@ -597,6 +598,7 @@ class RolloutSession:
             item=pending.item,
             messages=pending.messages,
             response_text=content,
+            last_response_text=content,
             response_tokens=response.response_tokens,
             response_logprobs=response.response_logprobs,
             trace=trace,
@@ -635,6 +637,7 @@ class RolloutSession:
         old_response_len = len(existing.response_tokens)
         if new_sample.response_text:
             existing.response_text = f"{existing.response_text}\n{new_sample.response_text}" if existing.response_text else new_sample.response_text
+            existing.last_response_text = new_sample.response_text
         existing.response_tokens.extend(new_sample.response_tokens)
         existing.response_logprobs.extend(new_sample.response_logprobs)
         existing.trace.extend(new_sample.trace)
