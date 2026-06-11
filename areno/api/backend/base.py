@@ -97,6 +97,26 @@ class Backend(ABC):
 
         raise NotImplementedError(f"{type(self).__name__} does not support model roles")
 
+    def begin_rollout_session(self, ctx: Context) -> None:
+        """Prepare backend state for one or more rollout calls."""
+
+        del ctx
+
+    async def begin_rollout_session_async(self, ctx: Context) -> None:
+        """Async rollout-session begin hook."""
+
+        self.begin_rollout_session(ctx)
+
+    def end_rollout_session(self, ctx: Context) -> None:
+        """Finalize rollout state before scoring or training."""
+
+        del ctx
+
+    async def end_rollout_session_async(self, ctx: Context) -> None:
+        """Async rollout-session end hook."""
+
+        self.end_rollout_session(ctx)
+
     def score_logprobs(self, ctx: Context, role: str, token_rows: list[list[int]]) -> list[list[float]]:
         """Score fixed token rows with a backend-owned role."""
 

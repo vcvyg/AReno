@@ -4,8 +4,8 @@ Inference CLI reference
 ``areno serve``
 
 Start an OpenAI-compatible HTTP server backed by the Areno inference engine.
-The server exposes ``/v1/chat/completions`` and batches compatible requests in a
-continuous decode loop.
+The server exposes ``/v1/chat/completions``, accepts standard chat-completion
+``tools`` fields, and batches compatible requests in a continuous decode loop.
 
 .. code-block:: bash
 
@@ -143,6 +143,13 @@ Request fields
    * - ``seed``
      - ``int | None``
      - Deterministic sampling seed when sampling is enabled.
+   * - ``tools``
+     - ``list[Tool] | None``
+     - OpenAI-compatible function tools. Model-native tool-call text is parsed
+       into ``message.tool_calls`` for supported model families.
+   * - ``tool_choice``
+     - ``str | dict | None``
+     - Optional tool-choice directive, including a forced function name.
 
 ``ChatMessage`` fields:
 
@@ -167,6 +174,43 @@ when these fields match:
 * EOS token id
 
 Requests with different generation settings are scheduled separately.
+
+Tool calls
+----------
+
+``areno serve`` supports the Chat Completions tool-call shape:
+
+.. code-block:: python
+
+   from openai import OpenAI
+
+   client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="unused")
+   response = client.chat.completions.create(
+       model="areno",
+       messages=[{"role": "user", "content": "Choose a move: left or right."}],
+       tools=[
+           {
+               "type": "function",
+               "function": {
+                   "name": "choose_move",
+                   "parameters": {
+                       "type": "object",
+                       "properties": {
+                           "direction": {"type": "string", "enum": ["left", "right"]},
+                       },
+                       "required": ["direction"],
+                   },
+               },
+           }
+       ],
+       tool_choice={"type": "function", "function": {"name": "choose_move"}},
+   )
+
+   print(response.choices[0].message.tool_calls)
+
+Tool-call parsing is selected from the model/tokenizer family. Current parsers
+cover Qwen/Qwen3.5/MiniCPM-style ``<tool_call>`` blocks, Gemma4 tool-call
+blocks, and generic JSON tool-call output.
 
 Help
 ----

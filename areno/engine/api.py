@@ -15,7 +15,7 @@ High-level responsibilities:
   the simple single-process result shape returned to the caller.
 * Expose the rollout/train/score/checkpoint operations as plain Python methods
   while hiding the underlying RPC-style ``call`` / fire-and-forget
-  ``broadcast`` semantics.
+  request-demux semantics.
 """
 
 from __future__ import annotations
@@ -31,8 +31,6 @@ from areno.engine.protocol import (
     EnsureRolesPayload,
     Op,
     RoleSpecPayload,
-    RolloutAddPayload,
-    RolloutPartialPayload,
     RolloutPayload,
     SaveCheckpointPayload,
     ScorePayload,
@@ -61,14 +59,14 @@ class ArenoEngine:
     merges rank-0 DP results back into the simple API shape returned to the
     caller.
 
-    Two dispatch patterns are used against the cluster:
+    Two request patterns are used against the cluster:
 
     * ``cluster.call(op, payload)`` -- blocking RPC-style; waits for every rank
       to return a result. Used for ops where the caller needs outputs
       (rollout, train step, scoring, checkpoint).
-    * ``cluster.broadcast(op, payload)`` -- fire-and-forget object broadcast;
-      returns immediately without waiting for workers. Used for the
-      continuous-batching attach path (``add_rollout_batch``).
+    * ``cluster.call_async(op, payload)`` -- async request-id demux over the
+      same worker queues, used by request-concurrent serving and agentic
+      rollout paths.
     """
 
     def __init__(self, config: EngineConfig):
@@ -87,6 +85,26 @@ class ArenoEngine:
         # ``ArenoWorker`` is the rank-side command loop.
         self.cluster = TPCluster(config, ArenoWorker)
         self.cluster.start()
+
+    def begin_rollout_session(self) -> None:
+        """Prepare workers for one or more rollout calls."""
+
+        self.cluster.call(Op.ROLLOUT_SESSION_BEGIN)
+
+    async def begin_rollout_session_async(self) -> None:
+        """Async variant of :meth:`begin_rollout_session`."""
+
+        await self.cluster.call_async(Op.ROLLOUT_SESSION_BEGIN)
+
+    def end_rollout_session(self) -> None:
+        """Finalize rollout state and prepare train weights."""
+
+        self.cluster.call(Op.ROLLOUT_SESSION_END)
+
+    async def end_rollout_session_async(self) -> None:
+        """Async variant of :meth:`end_rollout_session`."""
+
+        await self.cluster.call_async(Op.ROLLOUT_SESSION_END)
 
     @classmethod
     def from_pretrained(
@@ -140,9 +158,7 @@ class ArenoEngine:
         eos_token_id: int | None = None,
         sampling_params: SamplingParams | None = None,
         decode_progress_interval_s: float = 0.0,
-        partial_callback: Callable[[int, list[int], str], None] | None = None,
         cancel_flags: torch.Tensor | None = None,
-        session_id: int | None = None,
     ) -> RolloutOutput:
         """Generate rollout tokens for pre-tokenized prompts.
 
@@ -153,11 +169,7 @@ class ArenoEngine:
 
         Prompts are chunked by DP size and prefill-token budget so each worker
         can run bounded prefill batches while decode continues to use a fixed
-        paged-KV allocation. When ``session_id`` is provided the call follows
-        the continuous-batching contract: each chunk inherits a slightly larger
-        ``local_max_running`` than the chunk's own size so newly-arriving
-        prompts (via :meth:`add_rollout_batch`) can attach without forcing the
-        worker to rebuild its KV pool.
+        paged-KV allocation.
         """
 
         if not prompts:
@@ -170,47 +182,33 @@ class ArenoEngine:
         # or fall back to the longest prompt actually seen.
         rollout_max_prompt_len = int(max_prompt_len) if max_prompt_len is not None else max(len(prompt) for prompt in prompts)
         rollout_max_cache_len = rollout_max_prompt_len + max_new_tokens
-        # Worst-case prefill = every running slot prefilling its full prompt.
-        max_prefill_tokens = max_running_prompts * rollout_max_prompt_len
         dp_size = int(self.config.dp_size)
-        for chunk in _chunk_prompts_for_prefill_budget(
+        local_max_running_prompts = max(ceil_div(int(max_running_prompts), dp_size), 1)
+        # Worst-case per-rank prefill = every local running slot prefilling its
+        # full prompt. The public max_running_prompts value is global.
+        max_prefill_tokens = local_max_running_prompts * rollout_max_prompt_len
+        chunks = _chunk_prompts_for_prefill_budget(
             prompts,
             max_running_prompts=max_running_prompts,
             dp_size=dp_size,
             max_prefill_tokens=max_prefill_tokens,
-        ):
+        )
+        for chunk in chunks:
             # Global offset of this chunk inside the user's input list, used to
-            # restore original indices when merging DP results / partial events.
+            # restore original indices when merging DP results.
             chunk_start = sum(len(output.prompt_ids) for output in outputs)
             # Round-robin chunk rows across DP ranks; per-rank token rows.
             prompts_by_dp = split_list_by_dp(chunk, int(self.config.dp_size))
             # Parallel split of the global prompt indices for downstream mapping.
             prompt_indices_by_dp = split_list_by_dp(list(range(chunk_start, chunk_start + len(chunk))), int(self.config.dp_size))
             # Largest per-rank queue depth for the current chunk; floor of 1
-            # avoids zero-sized KV pools for trailing partial chunks.
+            # avoids zero-sized KV pools for trailing chunks.
             current_local_running = max(max((len(rows) for rows in prompts_by_dp), default=0), 1)
-            # In session mode reserve +8 headroom so add_rollout_batch can
-            # attach late arrivals without re-allocating the KV pool; outside
-            # session mode the pool is sized exactly to the chunk.
-            local_max_running = (
-                min(int(max_running_prompts), current_local_running + 8)
-                if session_id is not None
-                else current_local_running
-            )
+            local_max_running = current_local_running
             # Honour per-prompt cache length if any prompt+max_new exceeds the
             # global ceiling computed from rollout_max_prompt_len.
             max_cache_len = max(max(len(prompt) + max_new_tokens for prompt in chunk), rollout_max_cache_len)
             max_blocks_per_seq = ceil_div(max_cache_len, self.config.runtime.kv_block_size)
-            partial = None
-            if partial_callback is not None:
-                # Wrap the user callback so worker-side payloads (which carry
-                # chunk-local rows) are translated back into global indices.
-                partial = _partial_callback_for_chunk(
-                    partial_callback,
-                    chunk_start=chunk_start,
-                    chunk_size=len(chunk),
-                    dp_size=dp_size,
-                )
             # Blocking RPC: returns one result per rank after every prompt
             # finishes (or the cancel flag fires).
             results = self.cluster.call(
@@ -218,7 +216,6 @@ class ArenoEngine:
                 RolloutPayload(
                     prompts_by_dp=prompts_by_dp,
                     prompt_indices_by_dp=prompt_indices_by_dp,
-                    session_id=session_id,
                     max_new_tokens=max_new_tokens,
                     eos_token_id=eos_token_id,
                     sampling_params=sampling_params,
@@ -237,60 +234,86 @@ class ArenoEngine:
                     if cancel_flags is not None
                     else None,
                 ),
-                partial_callback=partial,
             )
             # Drop TP duplicates (only DP rank 0 carries real results) and
             # re-order DP-shuffled rows back into chunk input order.
+            dp_outputs = dp_rank0_results(results, self.config.tp_size, int(self.config.dp_size))
+            total_count = len(chunk)
             outputs.append(
                 _merge_dp_rollouts_in_input_order(
-                    dp_rank0_results(results, self.config.tp_size, int(self.config.dp_size)),
-                    total_count=len(chunk),
+                    dp_outputs,
+                    total_count=total_count,
                 )
             )
         # Fast path for single-chunk inputs; otherwise concat per-chunk outputs.
         return outputs[0] if len(outputs) == 1 else _merge_rollouts(outputs)
 
-    def add_rollout_batch(
+    async def generate_rollout_async(
         self,
         prompts: list[list[int]],
         *,
-        session_id: int,
-        prompt_offset: int,
+        max_new_tokens: int,
+        max_running_prompts: int,
+        max_prompt_len: int | None = None,
+        eos_token_id: int | None = None,
+        sampling_params: SamplingParams | None = None,
+        decode_progress_interval_s: float = 0.0,
         cancel_flags: torch.Tensor | None = None,
-    ) -> None:
-        """Attach more prompts to an in-flight rollout session.
+    ) -> RolloutOutput:
+        """Async rollout path using TPCluster request-id demux."""
 
-        Dispatches ``Op.INFER_ROLLOUT_ADD`` via the non-blocking
-        ``cluster.broadcast`` path. The matching :meth:`generate_rollout` call
-        must already be running with the same ``session_id``; the worker side
-        slots these new prompts into the existing continuous-batching loop
-        using ``prompt_offset`` to keep global indices stable.
-
-        ``cancel_flags`` shares the rollout caller's shared-memory tensor so
-        cancellations apply uniformly to original and attached prompts.
-
-        Non-blocking: returns once the command is enqueued; does not wait for
-        workers to acknowledge.
-        """
-
+        if not prompts:
+            raise ValueError("prompts must be non-empty")
+        if max_running_prompts < 1:
+            raise ValueError("max_running_prompts must be >= 1")
+        sampling_params = sampling_params or SamplingParams()
+        outputs = []
+        rollout_max_prompt_len = int(max_prompt_len) if max_prompt_len is not None else max(len(prompt) for prompt in prompts)
+        rollout_max_cache_len = rollout_max_prompt_len + max_new_tokens
         dp_size = int(self.config.dp_size)
-        # Round-robin attach across DP ranks (matches generate_rollout policy).
-        prompts_by_dp = split_list_by_dp(prompts, dp_size)
-        # prompt_offset is the absolute index of the first new prompt inside
-        # the session's input space; preserves global ordering across attaches.
-        prompt_indices_by_dp = split_list_by_dp(list(range(prompt_offset, prompt_offset + len(prompts))), dp_size)
-        # broadcast = object send only, no result collection. The worker's
-        # ongoing rollout loop will pick this command up between decode steps.
-        self.cluster.broadcast(
-            Op.INFER_ROLLOUT_ADD,
-            RolloutAddPayload(
-                session_id=int(session_id),
-                prompts_by_dp=prompts_by_dp,
-                prompt_indices_by_dp=prompt_indices_by_dp,
-                cancel_flags=cancel_flags,
-                cancel_indices_by_dp=split_list_by_dp(list(range(len(prompts))), dp_size) if cancel_flags is not None else None,
-            ),
+        local_max_running_prompts = max(ceil_div(int(max_running_prompts), dp_size), 1)
+        max_prefill_tokens = local_max_running_prompts * rollout_max_prompt_len
+        chunks = _chunk_prompts_for_prefill_budget(
+            prompts,
+            max_running_prompts=max_running_prompts,
+            dp_size=dp_size,
+            max_prefill_tokens=max_prefill_tokens,
         )
+        for chunk in chunks:
+            chunk_start = sum(len(output.prompt_ids) for output in outputs)
+            prompts_by_dp = split_list_by_dp(chunk, dp_size)
+            prompt_indices_by_dp = split_list_by_dp(list(range(chunk_start, chunk_start + len(chunk))), dp_size)
+            current_local_running = max(max((len(rows) for rows in prompts_by_dp), default=0), 1)
+            max_cache_len = max(max(len(prompt) + max_new_tokens for prompt in chunk), rollout_max_cache_len)
+            max_blocks_per_seq = ceil_div(max_cache_len, self.config.runtime.kv_block_size)
+            results = await self.cluster.call_async(
+                Op.INFER_ROLLOUT,
+                RolloutPayload(
+                    prompts_by_dp=prompts_by_dp,
+                    prompt_indices_by_dp=prompt_indices_by_dp,
+                    max_new_tokens=max_new_tokens,
+                    eos_token_id=eos_token_id,
+                    sampling_params=sampling_params,
+                    max_running_seqs=current_local_running,
+                    max_cache_len=max_cache_len,
+                    max_blocks_per_seq=max_blocks_per_seq,
+                    max_prefill_tokens=max_prefill_tokens,
+                    num_blocks=current_local_running * max_blocks_per_seq,
+                    block_size=self.config.runtime.kv_block_size,
+                    decode_progress_interval_s=decode_progress_interval_s,
+                    cancel_flags=cancel_flags,
+                    cancel_indices_by_dp=split_list_by_dp(list(range(chunk_start, chunk_start + len(chunk))), dp_size)
+                    if cancel_flags is not None
+                    else None,
+                ),
+            )
+            outputs.append(
+                _merge_dp_rollouts_in_input_order(
+                    dp_rank0_results(results, self.config.tp_size, dp_size),
+                    total_count=len(chunk),
+                )
+            )
+        return outputs[0] if len(outputs) == 1 else _merge_rollouts(outputs)
 
     def step(self, data_packs: list[dict[str, Any]], *, gradient_accumulation_steps: int | None = None) -> list[TrainStats]:
         """Run one or more train data packs through the DP/TP worker cluster.
@@ -491,9 +514,9 @@ def _chunk_prompts_for_prefill_budget(
     per-rank index is computed via round-robin position inside the chunk.
     """
 
-    # Hard cap on prompts per chunk: every rank holds up to max_running_prompts
-    # active sequences at once.
-    max_chunk_size = max_running_prompts * dp_size
+    # Hard cap on prompts per chunk. max_running_prompts is a global flat
+    # rollout cap; DP splitting happens after chunking.
+    max_chunk_size = max_running_prompts
     chunks: list[list[list[int]]] = []
     chunk: list[list[int]] = []
     token_sums = [0 for _ in range(dp_size)]
@@ -515,47 +538,6 @@ def _chunk_prompts_for_prefill_budget(
     if chunk:
         chunks.append(chunk)
     return chunks
-
-
-def _partial_callback_for_chunk(
-    callback: Callable[[int, list[int], str], None],
-    *,
-    chunk_start: int,
-    chunk_size: int,
-    dp_size: int,
-) -> Callable[[int, Any], None]:
-    """Wrap a user callback to translate per-DP partial events to globals.
-
-    The worker emits ``infer_rollout_partial`` payloads with chunk-local row
-    indices (and optionally explicit ``prompt_indices``). This wrapper rewrites
-    them back into the caller's global prompt index space so the public
-    callback signature stays simple.
-    """
-
-    def _handle(_rank: int, payload: Any) -> None:
-        # Filter out unrelated broadcast events.
-        if not isinstance(payload, RolloutPartialPayload):
-            return
-        dp_rank = int(payload.dp_rank)
-        rows = payload.rows
-        response_ids = payload.response_ids
-        finish_reason = payload.finish_reason
-        prompt_indices = payload.prompt_indices
-        if prompt_indices is not None:
-            # Worker already provided absolute indices (continuous-batching
-            # path): pass them through verbatim.
-            for prompt_index, ids, reason in zip(prompt_indices, response_ids, finish_reason, strict=True):
-                callback(int(prompt_index), ids, str(reason))
-            return
-        # Otherwise reconstruct the global index from the chunk-local row and
-        # the DP rank using the same round-robin layout as split_list_by_dp.
-        for row, ids, reason in zip(rows, response_ids, finish_reason, strict=True):
-            index = chunk_start + int(row) * dp_size + dp_rank
-            # Guard against padding rows that exceed the actual chunk size.
-            if index < chunk_start + chunk_size:
-                callback(index, ids, str(reason))
-
-    return _handle
 
 
 def _first_rank0_result(results: list[Any], tp_size: int, dp_size: int):

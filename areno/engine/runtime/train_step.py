@@ -124,6 +124,7 @@ def _pack_train_data(data_pack: dict[str, Any]) -> dict[str, Any]:
     packed_seq_ids = torch.empty(action_count, device=input_ids.device, dtype=torch.long)
 
     prompt_mask = data_pack.get("prompt_mask")
+    loss_mask = data_pack.get("loss_mask")
     advantages = data_pack.get("advantages")
     rollout_logprobs = data_pack.get("logprobs")
     ref_logprobs = data_pack.get("ref_logprobs")
@@ -149,7 +150,10 @@ def _pack_train_data(data_pack: dict[str, Any]) -> dict[str, Any]:
             # `action_offset + k` corresponds to the prediction of token k+1.
             action_len = length - 1
             action_slice = slice(action_offset, action_offset + action_len)
-            packed_response_mask[action_slice] = ~prompt_mask[row, 1:length].to(dtype=torch.bool)
+            response_mask = ~prompt_mask[row, 1:length].to(dtype=torch.bool)
+            if isinstance(loss_mask, torch.Tensor):
+                response_mask = response_mask & loss_mask[row, 1:length].to(dtype=torch.bool)
+            packed_response_mask[action_slice] = response_mask
             packed_advantages[action_slice] = advantages[row, 1:length].to(dtype=torch.float32)
             packed_logprobs[action_slice] = rollout_logprobs[row, 1:length].to(dtype=torch.float32)
             if has_ppo_fields:

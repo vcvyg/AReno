@@ -60,6 +60,8 @@ def _trainer_config_from_options(**options) -> TrainerConfig:
         raise click.UsageError("--max-new-tokens must be positive")
     if algorithm.requires_rollout and args.max_running_prompts is not None and args.max_running_prompts <= 0:
         raise click.UsageError("--max-running-prompts must be positive")
+    if args.agent_timeout_s <= 0:
+        raise click.UsageError("--agent-timeout-s must be positive")
     if args.lr_decay_steps <= 0:
         raise click.UsageError("--lr-decay-steps must be positive")
     if args.critic_warmup_steps < 0:
@@ -97,9 +99,12 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             grad_clip_norm=args.grad_clip_norm,
             adam_8bit=args.adam_8bit,
             activation_checkpointing=args.activation_checkpointing,
-            keep_rollout_state=args.keep_rollout_state,
+            keep_rollout_state=not args.drop_rollout_state,
             eager_decode=args.eager_decode,
             metrics_log_dir=args.metrics_log_dir,
+            agent_fn=args.agent_fn,
+            agent_timeout_s=args.agent_timeout_s,
+            train_tool_results=args.train_tool_results,
             ref_ckpt=args.ref_ckpt,
             dpo_beta=args.dpo_beta,
         )
@@ -129,9 +134,12 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             grad_clip_norm=args.grad_clip_norm,
             adam_8bit=args.adam_8bit,
             activation_checkpointing=args.activation_checkpointing,
-            keep_rollout_state=args.keep_rollout_state,
+            keep_rollout_state=not args.drop_rollout_state,
             eager_decode=args.eager_decode,
             metrics_log_dir=args.metrics_log_dir,
+            agent_fn=args.agent_fn,
+            agent_timeout_s=args.agent_timeout_s,
+            train_tool_results=args.train_tool_results,
         )
     if algorithm.name != "ppo":
         return PolicyTrainerConfig(
@@ -166,11 +174,14 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             grad_clip_norm=args.grad_clip_norm,
             adam_8bit=args.adam_8bit,
             activation_checkpointing=args.activation_checkpointing,
-            keep_rollout_state=args.keep_rollout_state,
+            keep_rollout_state=not args.drop_rollout_state,
             eager_decode=args.eager_decode,
             gspo_clip_eps=args.gspo_clip_eps,
             grpo_clip_eps=args.grpo_clip_eps,
             metrics_log_dir=args.metrics_log_dir,
+            agent_fn=args.agent_fn,
+            agent_timeout_s=args.agent_timeout_s,
+            train_tool_results=args.train_tool_results,
         )
     return PPOTrainerConfig(
         algo=algorithm.name,
@@ -204,7 +215,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
         grad_clip_norm=args.grad_clip_norm,
         adam_8bit=args.adam_8bit,
         activation_checkpointing=args.activation_checkpointing,
-        keep_rollout_state=args.keep_rollout_state,
+        keep_rollout_state=not args.drop_rollout_state,
         eager_decode=args.eager_decode,
         gspo_clip_eps=args.gspo_clip_eps,
         grpo_clip_eps=args.grpo_clip_eps,
@@ -223,6 +234,9 @@ def _trainer_config_from_args(args) -> TrainerConfig:
         gamma=args.gamma,
         lam=args.lam,
         critic_warmup_steps=args.critic_warmup_steps,
+        agent_fn=args.agent_fn,
+        agent_timeout_s=args.agent_timeout_s,
+        train_tool_results=args.train_tool_results,
     )
 
 
@@ -451,7 +465,7 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
     "--max-running-prompts",
     type=int,
     default=None,
-    help="Override concurrent rollout prompts; defaults to batch-size * n-samples // dp-size.",
+    help="Override global concurrent rollout prompts; defaults to batch-size * n-samples.",
 )
 @click.option("--lr", type=float, default=1.0e-6, show_default=True, help="Policy optimizer learning rate.")
 @click.option("--min-lr", type=float, default=1.0e-7, show_default=True, help="Policy optimizer minimum learning rate.")
@@ -469,11 +483,14 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
     help="Enable decoder-layer activation recompute during training.",
 )
 @click.option(
-    "--keep-rollout-state",
+    "--drop-rollout-state",
     is_flag=True,
-    help="Keep rollout state on GPU between steps for speed.",
+    help="Drop rollout state after each step to save GPU memory.",
 )
 @click.option("--eager-decode", is_flag=True, help="Disable decode CUDA graph and run rollout decode eagerly.")
+@click.option("--agent-fn", default=None, help="Python file defining async run_agent(ctx, batch) for agentic rollout.")
+@click.option("--agent-timeout-s", type=float, default=300.0, show_default=True, help="Agentic rollout proxy request timeout.")
+@click.option("--train-tool-results", is_flag=True, help="Include tool-result spans in agentic policy loss.")
 @click.option("--gspo-clip-eps", type=float, default=3.0e-4, show_default=True, help="GSPO sequence-ratio clipping epsilon.")
 @click.option("--grpo-clip-eps", type=float, default=0.2, show_default=True, help="GRPO token-ratio clipping epsilon.")
 @click.option("--dpo-beta", type=float, default=0.1, show_default=True, help="DPO preference margin temperature.")

@@ -36,6 +36,40 @@ _SYS_PATH_LOCK = Lock()
 _SYS_PATH_PREFERRED = False
 
 
+def _rollout_options(ctx: Context, sampling_params: SamplingParams):
+    """Translate public rollout params to areno engine-native options."""
+
+    max_prompt_len = sampling_params.max_prompt_len
+    eos_token_ids = () if sampling_params.ignore_eos else ctx.eos_token_ids
+    stop_token_ids = tuple(sampling_params.stop_token_ids or ())
+    suppress_candidates = set(_explicit_suppress_token_ids(ctx.tokenizer))
+    if not sampling_params.ignore_eos:
+        suppress_candidates.update(int(token_id) for token_id in getattr(ctx.tokenizer, "all_special_ids", ()) or ())
+    suppress_token_ids = tuple(sorted(token_id for token_id in suppress_candidates if token_id not in {*eos_token_ids, *stop_token_ids}))
+    cfg = ctx.custom_config
+    if cfg is None:
+        cfg = ArenoConfig()
+    if not isinstance(cfg, ArenoConfig):
+        raise TypeError(f"ArenoBackend requires ArenoConfig, got {type(cfg)!r}")
+
+    from areno import SamplingParams as ArenoSamplingParams
+
+    return {
+        "max_prompt_len": max_prompt_len,
+        "eos_token_id": eos_token_ids,
+        "max_running_prompts": cfg.max_running_prompts,
+        "decode_progress_interval_s": cfg.decode_progress_interval_s,
+        "sampling_params": ArenoSamplingParams(
+            temperature=0.0 if sampling_params.greedy else sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            top_k=max(0, sampling_params.top_k),
+            stop_token_ids=stop_token_ids,
+            suppress_token_ids=suppress_token_ids,
+            suppress_special_tokens=not sampling_params.ignore_eos,
+        ),
+    }
+
+
 def _prefer_repo_areno() -> None:
     """Prefer this repository's engine packages over installed wheels.
 
@@ -146,24 +180,7 @@ class ArenoBackend(Backend):
         # engine treats each completion as independent while preserving the
         # `[prompt0_sample0, prompt0_sample1, ..., promptN_sampleK]` layout.
         flat_prompts = [ids for ids in prompt_tokens for _ in range(n_samples)]
-        max_prompt_len = sampling_params.max_prompt_len
-        eos_token_ids = () if sampling_params.ignore_eos else ctx.eos_token_ids
-        stop_token_ids = tuple(sampling_params.stop_token_ids or ())
-        # Suppress non-generative marker tokens. Some tokenizers do not include
-        # pad/bos/unk in all_special_ids, so add them explicitly.
-        suppress_candidates = set(_explicit_suppress_token_ids(ctx.tokenizer))
-        if not sampling_params.ignore_eos:
-            suppress_candidates.update(int(token_id) for token_id in getattr(ctx.tokenizer, "all_special_ids", ()) or ())
-        suppress_token_ids = tuple(sorted(token_id for token_id in suppress_candidates if token_id not in {*eos_token_ids, *stop_token_ids}))
-        cfg = ctx.custom_config
-        if cfg is None:
-            cfg = ArenoConfig()
-        if not isinstance(cfg, ArenoConfig):
-            raise TypeError(f"ArenoBackend requires ArenoConfig, got {type(cfg)!r}")
-        max_running_prompts = cfg.max_running_prompts
-        decode_progress_interval_s = cfg.decode_progress_interval_s
-
-        from areno import SamplingParams as ArenoSamplingParams
+        options = _rollout_options(ctx, sampling_params)
 
         rollout_start = time.perf_counter()
         if self._step_e2e_start is None:
@@ -175,24 +192,88 @@ class ArenoBackend(Backend):
             rollout = engine.generate_rollout(
                 flat_prompts,
                 max_new_tokens=sampling_params.max_new_tokens,
-                max_running_prompts=max_running_prompts,
-                max_prompt_len=max_prompt_len,
-                eos_token_id=eos_token_ids,
-                decode_progress_interval_s=decode_progress_interval_s,
-                sampling_params=ArenoSamplingParams(
-                    temperature=0.0 if sampling_params.greedy else sampling_params.temperature,
-                    top_p=sampling_params.top_p,
-                    top_k=max(0, sampling_params.top_k),
-                    stop_token_ids=stop_token_ids,
-                    suppress_token_ids=suppress_token_ids,
-                    suppress_special_tokens=not sampling_params.ignore_eos,
-                ),
+                max_running_prompts=options["max_running_prompts"],
+                max_prompt_len=options["max_prompt_len"],
+                eos_token_id=options["eos_token_id"],
+                decode_progress_interval_s=options["decode_progress_interval_s"],
+                sampling_params=options["sampling_params"],
             )
         finally:
             rollout_generate_time_s = time.perf_counter() - rollout_start
             self._step_rollout_time_s += rollout_generate_time_s
         # Repack the flat result into per-prompt groups of `n_samples`
         # completions so downstream code can iterate `for item, result`.
+        results = []
+        for prompt_idx in range(len(prompt_tokens)):
+            start = prompt_idx * n_samples
+            end = start + n_samples
+            results.append(
+                RolloutResult(
+                    sequences=[
+                        RolloutSequence(
+                            resp_tokens=tokens,
+                            resp_logprobs=rollout.logprobs[i, : len(tokens)].tolist(),
+                        )
+                        for i, tokens in enumerate(rollout.response_ids[start:end], start=start)
+                    ]
+                )
+            )
+        return results
+
+    def begin_rollout_session(self, ctx: Context) -> None:
+        """Prepare colocated actor state before rollout requests are issued."""
+
+        del ctx
+        self._require_engine().begin_rollout_session()
+
+    async def begin_rollout_session_async(self, ctx: Context) -> None:
+        """Async rollout-session begin hook for agentic callers."""
+
+        del ctx
+        await self._require_engine().begin_rollout_session_async()
+
+    def end_rollout_session(self, ctx: Context) -> None:
+        """Finalize rollout-only state before scoring or training."""
+
+        del ctx
+        self._require_engine().end_rollout_session()
+
+    async def end_rollout_session_async(self, ctx: Context) -> None:
+        """Async rollout-session end hook for agentic callers."""
+
+        del ctx
+        await self._require_engine().end_rollout_session_async()
+
+    async def rollout_batch_async(
+        self,
+        ctx: Context,
+        prompt_tokens: list[list[int]],
+        n_samples: int,
+        sampling_params: SamplingParams,
+    ) -> list[RolloutResult]:
+        """Async rollout entry for serving/agentic callers."""
+
+        engine = self._require_engine()
+        if not prompt_tokens:
+            return []
+        prompts = [tokens for tokens in prompt_tokens for _ in range(n_samples)]
+        options = _rollout_options(ctx, sampling_params)
+        rollout_start = time.perf_counter()
+        if self._step_e2e_start is None:
+            self._step_e2e_start = rollout_start
+            self._step_rollout_time_s = 0.0
+        try:
+            rollout = await engine.generate_rollout_async(
+                prompts,
+                max_new_tokens=sampling_params.max_new_tokens,
+                max_running_prompts=options["max_running_prompts"],
+                max_prompt_len=options["max_prompt_len"],
+                eos_token_id=options["eos_token_id"],
+                decode_progress_interval_s=options["decode_progress_interval_s"],
+                sampling_params=options["sampling_params"],
+            )
+        finally:
+            self._step_rollout_time_s += time.perf_counter() - rollout_start
         results = []
         for prompt_idx in range(len(prompt_tokens)):
             start = prompt_idx * n_samples
@@ -346,6 +427,9 @@ def _make_train_pack(seqs: list[TrainSequence]) -> dict[str, torch.Tensor]:
     max_len = int(lengths.max().item()) if batch else 0
     input_ids = pad_rows([seq.tokens for seq in seqs], dtype=torch.long, fill_value=eos_token_id, width=max_len)
     prompt_mask = pad_rows([seq.prompt_mask for seq in seqs], dtype=torch.bool, fill_value=True, width=max_len)
+    has_loss_mask = any(bool(seq.loss_mask) for seq in seqs)
+    loss_mask_rows = [seq.loss_mask if seq.loss_mask else [not item for item in seq.prompt_mask] for seq in seqs]
+    loss_mask = pad_rows(loss_mask_rows, dtype=torch.bool, fill_value=False, width=max_len) if has_loss_mask else None
     logprobs = pad_rows([seq.logprobs for seq in seqs], dtype=torch.float32, width=max_len)
     advantages = pad_rows([seq.advantages for seq in seqs], dtype=torch.float32, width=max_len)
     # Allocate optional fields only when at least one sequence carries them so
@@ -365,6 +449,8 @@ def _make_train_pack(seqs: list[TrainSequence]) -> dict[str, torch.Tensor]:
         "logprobs": logprobs,
         "advantages": advantages,
     }
+    if loss_mask is not None:
+        pack["loss_mask"] = loss_mask
     if returns is not None:
         pack["returns"] = returns
     if values is not None:

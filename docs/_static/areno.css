@@ -50,14 +50,14 @@
   font-size: .85rem;
 }
 
-.card-grid {
+.landing-page .areno-feature-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
   gap: 1rem;
   margin: 1.3rem 0 2rem;
 }
 
-.feature-card {
+.landing-page .areno-feature-card {
   border: 1px solid var(--areno-card-border);
   border-radius: 16px;
   padding: 1.1rem;
@@ -65,16 +65,22 @@
   box-shadow: 0 12px 38px rgba(15, 23, 42, .08);
 }
 
-.feature-card strong {
+.landing-page .areno-feature-card strong {
   display: block;
   margin-bottom: .35rem;
   font-size: 1rem;
 }
 
-.feature-card p {
+.landing-page .areno-feature-card p {
   margin: 0;
   color: var(--sy-c-light);
   font-size: .92rem;
+}
+
+@media (max-width: 720px) {
+  .landing-page .areno-feature-grid {
+    grid-template-columns: 1fr !important;
+  }
 }
 
 div.highlight {

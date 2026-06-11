@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 import torch
@@ -10,6 +11,7 @@ from areno.cli import train as train_cli
 from areno.engine.config import EngineConfig, ModelConfig, RuntimeConfig, _parse_dtype
 from areno.engine.data import to_cpu, to_device
 from areno.api.data import PromptBatch, PromptItem
+from areno.api.trainer_config import RolloutTrainerConfig, TrainerConfig
 
 
 class ConfigAndDataTest(unittest.TestCase):
@@ -73,6 +75,50 @@ class ConfigAndDataTest(unittest.TestCase):
 
         self.assertEqual(cfg.dp_size, 2)
 
+    def test_rollout_config_defaults_max_running_prompts_to_flat_batch(self):
+        """Rollout concurrency defaults to batch_size * n_samples, not per-DP."""
+        cfg = RolloutTrainerConfig(
+            algo="gspo",
+            ckpt="unused",
+            dataset_path="unused",
+            world_size=8,
+            tp_size=1,
+            batch_size=32,
+            n_samples=8,
+        )
+
+        self.assertEqual(cfg.resolved_max_running_prompts(), 256)
+
+    def test_rollout_config_respects_explicit_max_running_prompts(self):
+        """An explicit max_running_prompts value should pass through unchanged."""
+        cfg = RolloutTrainerConfig(
+            algo="gspo",
+            ckpt="unused",
+            dataset_path="unused",
+            world_size=8,
+            tp_size=1,
+            batch_size=32,
+            n_samples=8,
+            max_running_prompts=64,
+        )
+
+        self.assertEqual(cfg.resolved_max_running_prompts(), 64)
+
+    def test_trainer_config_keeps_rollout_state_by_default(self):
+        """Runtime defaults should favor rollout speed unless explicitly disabled."""
+        cfg = TrainerConfig(algo="sft", ckpt="unused", dataset_path="unused")
+
+        self.assertTrue(cfg.keep_rollout_state)
+        self.assertTrue(cfg.areno_config().runtime["keep_rollout_state"])
+
+    def test_train_cli_drop_rollout_state_inverts_runtime_flag(self):
+        """The public CLI exposes the memory-saving inverse of keep_rollout_state."""
+        args = _train_args(algo="sft", drop_rollout_state=True)
+
+        cfg = train_cli._trainer_config_from_args(args)
+
+        self.assertFalse(cfg.keep_rollout_state)
+
     def test_to_device_and_to_cpu_walk_nested_containers(self):
         """Device helpers should preserve nested container structure."""
         src = {"x": torch.tensor([1.0]), "items": [torch.tensor([2.0]), (torch.tensor([3.0]), "keep")]}
@@ -117,6 +163,67 @@ class ConfigAndDataTest(unittest.TestCase):
             )
 
         self.assertEqual(dataset, [{"prompt": "loaded"}])
+
+
+def _train_args(**overrides):
+    defaults = dict(
+        algo="sft",
+        ckpt="unused",
+        dataset_path="unused",
+        dataset_loader_fn=None,
+        reward_fn_path=None,
+        save_path=None,
+        save_interval=100,
+        epochs=1,
+        tp_size=1,
+        world_size=1,
+        batch_size=1,
+        n_samples=1,
+        mini_bs=1,
+        gradient_accumulation_steps=None,
+        max_prompt_tokens=128,
+        max_new_tokens=16,
+        greedy=False,
+        temperature=1.0,
+        top_k=-1,
+        top_p=1.0,
+        max_running_prompts=None,
+        lr=1e-6,
+        min_lr=1e-7,
+        lr_decay_steps=1000,
+        lr_decay_style="cosine",
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_8bit=False,
+        weight_decay=1e-2,
+        grad_clip_norm=1.0,
+        activation_checkpointing=True,
+        drop_rollout_state=False,
+        eager_decode=False,
+        metrics_log_dir=None,
+        agent_fn=None,
+        agent_timeout_s=300.0,
+        train_tool_results=False,
+        gspo_clip_eps=3.0e-4,
+        grpo_clip_eps=0.2,
+        ref_ckpt=None,
+        dpo_beta=0.1,
+        reward_ckpt=None,
+        critic_ckpt=None,
+        critic_lr=1e-5,
+        use_kl_loss=True,
+        kl_loss_coef=0.001,
+        kl_loss_type="low_var_kl",
+        clip_eps=0.2,
+        clip_ratio_c=3.0,
+        value_clip_eps=0.5,
+        value_loss_coef=0.5,
+        gamma=1.0,
+        lam=1.0,
+        critic_warmup_steps=20,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
 
 
 if __name__ == "__main__":

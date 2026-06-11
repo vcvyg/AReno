@@ -14,6 +14,7 @@ from typing import Any
 from areno.api.config import BackendConfig, coerce_backend_config, resolve_backend_type
 from areno.api.context import Context
 from areno.api.data import PromptBatch, PromptItem
+from areno.api.agentic import LossMaskPolicy, RolloutSession
 from areno.api.metrics import MetricsRecorder
 from areno.api.tokenizer import encode_generation_prompt, eos_token_ids, load_tokenizer
 from areno.api.backend.base import Backend, get_backend_cls
@@ -57,6 +58,7 @@ class Trainer:
         # so `record_train_step` can flush a complete timing snapshot.
         self._metric_timings: dict[str, float] = {}
         self._step_active = False
+        self._rollout_session_depth = 0
 
     def init(self) -> None:
         """Load tokenizer, create backend context, and initialize workers."""
@@ -91,6 +93,46 @@ class Trainer:
         """Close the current trainer-owned step without running actor train."""
 
         self._step_active = False
+
+    def begin_rollout_session(self) -> None:
+        """Prepare backend rollout state for one or more rollout calls."""
+
+        if self._backend is None or self._ctx is None:
+            raise RuntimeError("Trainer is not initialized")
+        if self._rollout_session_depth == 0:
+            self._backend.begin_rollout_session(self._ctx)
+        self._rollout_session_depth += 1
+
+    async def begin_rollout_session_async(self) -> None:
+        """Async variant of :meth:`begin_rollout_session`."""
+
+        if self._backend is None or self._ctx is None:
+            raise RuntimeError("Trainer is not initialized")
+        if self._rollout_session_depth == 0:
+            await self._backend.begin_rollout_session_async(self._ctx)
+        self._rollout_session_depth += 1
+
+    def end_rollout_session(self) -> None:
+        """Finalize backend rollout state when a rollout group completes."""
+
+        if self._backend is None or self._ctx is None:
+            raise RuntimeError("Trainer is not initialized")
+        if self._rollout_session_depth <= 0:
+            return
+        self._rollout_session_depth -= 1
+        if self._rollout_session_depth == 0:
+            self._backend.end_rollout_session(self._ctx)
+
+    async def end_rollout_session_async(self) -> None:
+        """Async variant of :meth:`end_rollout_session`."""
+
+        if self._backend is None or self._ctx is None:
+            raise RuntimeError("Trainer is not initialized")
+        if self._rollout_session_depth <= 0:
+            return
+        self._rollout_session_depth -= 1
+        if self._rollout_session_depth == 0:
+            await self._backend.end_rollout_session_async(self._ctx)
 
     def load_prompt_batches(
         self,
@@ -163,11 +205,54 @@ class Trainer:
 
         # Rollout is the natural boundary of a new policy step. Consecutive
         # rollouts before train stay on the same step instead of bumping twice.
+        if self._rollout_session_depth <= 0:
+            raise RuntimeError("rollout_token_batch must be called inside `async with trainer.rollout_session(...)`")
         self._begin_step()
         start = time.perf_counter()
-        result = self._backend.rollout_batch(self._ctx, prompt_tokens, n_samples, sampling_params)
-        self._metric_timings["rollout"] = self._metric_timings.get("rollout", 0.0) + time.perf_counter() - start
-        return result
+        try:
+            result = self._backend.rollout_batch(self._ctx, prompt_tokens, n_samples, sampling_params)
+            return result
+        finally:
+            self._metric_timings["rollout"] = self._metric_timings.get("rollout", 0.0) + time.perf_counter() - start
+
+    async def rollout_token_batch_async(
+        self,
+        prompt_tokens: list[list[int]],
+        n_samples: int,
+        sampling_params: SamplingParams,
+    ) -> list[RolloutResult]:
+        """Async rollout variant for request-concurrent callers."""
+
+        if self._rollout_session_depth <= 0:
+            raise RuntimeError("rollout_token_batch_async must be called inside `async with trainer.rollout_session(...)`")
+        self._begin_step()
+        start = time.perf_counter()
+        rollout_async = getattr(self._backend, "rollout_batch_async")
+        try:
+            result = await rollout_async(self._ctx, prompt_tokens, n_samples, sampling_params)
+            return result
+        finally:
+            self._metric_timings["rollout"] = self._metric_timings.get("rollout", 0.0) + time.perf_counter() - start
+
+    def rollout_session(
+        self,
+        *,
+        sampling_params: SamplingParams,
+        loss_mask_policy: LossMaskPolicy | None = None,
+        max_running_prompts: int | None = None,
+        timeout_s: float = 300.0,
+        proxy: bool = True,
+    ) -> RolloutSession:
+        """Create an async rollout session, optionally with an OpenAI-compatible proxy."""
+
+        return RolloutSession(
+            self,
+            sampling_params=sampling_params,
+            loss_mask_policy=loss_mask_policy,
+            max_running_prompts=max_running_prompts,
+            timeout_s=timeout_s,
+            proxy=proxy,
+        )
 
     def train(
         self,

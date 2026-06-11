@@ -1,10 +1,10 @@
-"""Rollout, continuous batching, and decode graph management."""
+"""Rollout generation and decode graph management."""
 
 from __future__ import annotations
 
 import logging
 import math
-import queue
+import threading
 import time
 from dataclasses import dataclass
 
@@ -21,7 +21,7 @@ from areno.engine.data.sampling import (
     _tokens_match_any,
     _truncate_generated,
 )
-from areno.engine.protocol import Op, RolloutAddPayload, RolloutPartialPayload, RolloutPayload, WorkerResult
+from areno.engine.protocol import RolloutPayload
 from areno.engine.parallel.collectives import broadcast_object, broadcast_tensor
 from areno.engine.parallel.context import get_tp_context
 from areno.engine.runtime.common import _check_token_ids, _device_long
@@ -101,10 +101,16 @@ class PrefillPayload:
 
 
 class InferenceManager:
-    """Own rollout generation, continuous batching, and decode graph capture."""
+    """Own rollout generation and decode graph capture."""
 
     def __init__(self, worker):
         object.__setattr__(self, "worker", worker)
+        if not hasattr(worker, "_decode_progress_lock"):
+            worker._decode_progress_lock = threading.Lock()
+            worker._decode_progress_next_time = 0.0
+            worker._decode_progress_window_start = time.perf_counter()
+            worker._decode_progress_window_tokens = 0
+            worker._decode_progress_active: dict[int, int] = {}
 
     def __getattr__(self, name):
         return getattr(self.worker, name)
@@ -229,7 +235,6 @@ class InferenceManager:
                 decode_progress_interval_s=float(payload.decode_progress_interval_s),
                 cancel_flags=payload.cancel_flags,
                 cancel_indices=cancel_indices_by_dp[ctx.dp_rank] if cancel_indices_by_dp is not None else None,
-                session_id=payload.session_id,
                 prompt_indices=prompt_indices,
             )
             if ctx.is_rank0:
@@ -251,30 +256,26 @@ class InferenceManager:
         decode_progress_interval_s: float = 0.0,
         cancel_flags: torch.Tensor | None = None,
         cancel_indices: list[int] | None = None,
-        session_id: int | None = None,
         prompt_indices: list[int] | None = None,
     ) -> None:
         """Prefill all prompts then decode up to `max_new_tokens` without DP-sync.
 
-        Drives the continuous-batching loop in-place on `state`:
+        Drives the rollout loop in-place on `state`:
           * one prefill kernel for the initial batch produces the first token;
           * each decode step samples one token per active row, evicts finished
-            or cancelled rows from the active set, and admits any newly
-            requeued rows from the engine's command queue.
+            or cancelled rows from the active set, and admits pending rows
+            from the same rollout chunk.
 
         `cancel_flags` is a shared-memory bool tensor written by the engine
-        driver — we re-read it every step to support remote cancellation in
-        continuous-serving sessions.
+        driver; we re-read it every step to support remote cancellation.
         """
         ctx = get_tp_context()
         prompt_count = len(state.prompts)
-        if prompt_count > state.max_running_seqs:
-            raise RuntimeError("no-sync rollout requires all prompts to fit in one running batch")
         progress_enabled = decode_progress_interval_s > 0 and ctx.is_rank0
-        progress_rank = f"dp={ctx.dp_rank}/{ctx.dp_size}"
+        progress_key = id(state)
         # -------- prefill --------
         prefill_payload = state.build_prefill_payload()
-        if prefill_payload is None or len(state._seq_to_blocks) != prompt_count:
+        if prefill_payload is None:
             raise RuntimeError("no-sync rollout could not prefill all prompts; reduce batch size or increase token budget")
         sample_generator = _make_sample_generator(sampling_params, self.device)
         prefill = PrefillPayload.from_state_payload(
@@ -301,24 +302,30 @@ class InferenceManager:
         generated = torch.empty(prompt_count, state.max_new_tokens, device=self.device, dtype=torch.long)
         logprobs = torch.empty(prompt_count, state.max_new_tokens, device=self.device, dtype=torch.float32)
         response_lens = torch.zeros(prompt_count, device=self.device, dtype=torch.long)
-        generated[:, 0] = next_tokens
-        logprobs[:, 0] = next_logprobs
-        response_lens[:] = 1
+        initial_rows = torch.tensor(state._last_active_ids, device=self.device, dtype=torch.long)
+        generated[initial_rows, 0] = next_tokens
+        logprobs[initial_rows, 0] = next_logprobs
+        response_lens[initial_rows] = 1
         # block_table shape: (active_count, max_blocks_per_seq) of int32.
         block_table = prefill.block_table.to(self.device, non_blocking=True).int()
-        cache_seqlens = torch.tensor([len(prompt) for prompt in state.prompts], device=self.device, dtype=torch.int32)
+        cache_seqlens = torch.tensor([len(state.prompts[int(row)]) for row in initial_rows.tolist()], device=self.device, dtype=torch.int32)
         position_ids = cache_seqlens.to(torch.long)
         # active_rows[k] = the row index in `generated` of the k-th active seq.
-        active_rows = torch.arange(prompt_count, device=self.device, dtype=torch.long)
-        active_count = prompt_count
+        active_rows = initial_rows
+        active_count = int(initial_rows.numel())
         remove = torch.zeros(active_count, device=self.device, dtype=torch.bool)
         should_filter = False
         # Apply stop-token / cancel filters to the prefill output before
         # entering the decode loop, in case a prompt was already complete.
         if stop_token_ids:
             finished = _tokens_match_any(next_tokens, stop_token_ids)
-            self._emit_rollout_partials(active_rows[finished], generated, response_lens, "stop", prompt_indices_list)
+            self._mark_rollout_finished_rows(active_rows[finished], generated, logprobs, response_lens, "stop", prompt_indices_list)
             remove |= finished
+            should_filter = True
+        full_length = response_lens[active_rows] >= state.max_new_tokens
+        if bool(full_length.any().item()):
+            self._mark_rollout_finished_rows(active_rows[full_length], generated, logprobs, response_lens, "length", prompt_indices_list)
+            remove |= full_length
             should_filter = True
         cancelled = self._cancel_mask_for_active_rows(active_rows, cancel_flags, cancel_indices_tensor)
         if cancelled is not None:
@@ -337,53 +344,40 @@ class InferenceManager:
             block_table = block_table[keep]
             active_count = int(active_rows.numel())
         # -------- decode loop --------
-        decode_start = time.perf_counter()
-        next_progress_time = decode_start + decode_progress_interval_s
-        window_start = decode_start
-        window_tokens = 0
+        self._record_decode_progress(
+            enabled=progress_enabled,
+            interval_s=decode_progress_interval_s,
+            rollout_key=progress_key,
+            active_count=active_count,
+            token_delta=0,
+            cache_tokens=int(cache_seqlens.max().item()) if active_count else 0,
+            sample_step=1,
+            max_new_tokens=state.max_new_tokens,
+        )
         decoded_tokens = 0
-        idle_deadline: float | None = None
-        # Continuous-serving sessions wait up to 30s for new work before
-        # giving up; one-shot rollouts (session_id is None) exit immediately.
-        continuous_idle_timeout_s = 30.0 if session_id is not None else 0.0
-        for step in range(1, state.max_new_tokens):
+        sample_step = 1
+        while True:
             if active_count == 0:
-                # Idle gate: poll for new ADD commands until something is
-                # admitted or the timeout elapses.
-                while True:
-                    admitted = self._admit_rollout_additions(
-                        state,
-                        generated,
-                        logprobs,
-                        response_lens,
-                        next_tokens,
-                        cache_seqlens,
-                        position_ids,
-                        block_table,
-                        active_rows,
-                        prompt_indices_list,
-                        session_id,
-                        sampling_params,
-                        sample_generator,
-                        eos_token_id,
-                        step,
-                        stop_token_ids,
-                        cancel_token,
-                    )
-                    if admitted is not None:
-                        break
-                    if continuous_idle_timeout_s <= 0:
-                        break
-                    now = time.perf_counter()
-                    if idle_deadline is None:
-                        idle_deadline = now + continuous_idle_timeout_s
-                    if now >= idle_deadline:
-                        break
-                    time.sleep(0.01)
+                admitted = self._admit_pending_rollout_rows(
+                    state,
+                    generated,
+                    logprobs,
+                    response_lens,
+                    next_tokens,
+                    cache_seqlens,
+                    position_ids,
+                    block_table,
+                    active_rows,
+                    prompt_indices_list,
+                    sampling_params,
+                    sample_generator,
+                    eos_token_id,
+                    sample_step,
+                    stop_token_ids,
+                )
                 if admitted is None:
                     break
                 generated, logprobs, response_lens, next_tokens, cache_seqlens, position_ids, block_table, active_rows, active_count = admitted
-                idle_deadline = None
             next_tokens, next_logprobs = self._infer_decode_next_token_tensor(
                 next_tokens,
                 position_ids,
@@ -392,9 +386,10 @@ class InferenceManager:
                 active_count,
                 sampling_params,
                 sample_generator,
-                sample_step=step,
+                sample_step=sample_step,
                 eos_token_id=eos_token_id,
             )
+            sample_step += 1
             # Write the new tokens into the per-row response buffer using
             # advanced indexing: write_pos[k] is the next free slot for row k.
             write_pos = response_lens[active_rows]
@@ -402,7 +397,16 @@ class InferenceManager:
             logprobs[active_rows, write_pos] = next_logprobs
             response_lens[active_rows] = write_pos + 1
             decoded_tokens += active_count
-            window_tokens += active_count
+            self._record_decode_progress(
+                enabled=progress_enabled,
+                interval_s=decode_progress_interval_s,
+                rollout_key=progress_key,
+                active_count=active_count,
+                token_delta=active_count,
+                cache_tokens=int(cache_seqlens.max().item()) if active_count else 0,
+                sample_step=sample_step,
+                max_new_tokens=state.max_new_tokens,
+            )
             cache_seqlens.add_(1)
             position_ids.add_(1)
             remove = torch.zeros(active_count, device=self.device, dtype=torch.bool)
@@ -410,8 +414,13 @@ class InferenceManager:
             # EOS / stop-token filter.
             if stop_token_ids:
                 finished = _tokens_match_any(next_tokens, stop_token_ids)
-                self._emit_rollout_partials(active_rows[finished], generated, response_lens, "stop", prompt_indices_list)
+                self._mark_rollout_finished_rows(active_rows[finished], generated, logprobs, response_lens, "stop", prompt_indices_list)
                 remove |= finished
+                should_filter = True
+            full_length = response_lens[active_rows] >= state.max_new_tokens
+            if bool(full_length.any().item()):
+                self._mark_rollout_finished_rows(active_rows[full_length], generated, logprobs, response_lens, "length", prompt_indices_list)
+                remove |= full_length
                 should_filter = True
             # Cancellation filter (overrides the just-written token with the
             # cancel sentinel so downstream sees a clean stop).
@@ -433,49 +442,20 @@ class InferenceManager:
                 position_ids = position_ids[keep]
                 block_table = block_table[keep]
                 active_count = int(active_rows.numel())
-            # Opportunistically admit newly-queued rows mid-decode so we
-            # keep the batch full (continuous batching).
-            admitted = self._admit_rollout_additions(
-                state,
-                generated,
-                logprobs,
-                response_lens,
-                next_tokens,
-                cache_seqlens,
-                position_ids,
-                block_table,
-                active_rows,
-                prompt_indices_list,
-                session_id,
-                sampling_params,
-                sample_generator,
-                eos_token_id,
-                step,
-                stop_token_ids,
-                cancel_token,
-            )
-            if admitted is not None:
-                generated, logprobs, response_lens, next_tokens, cache_seqlens, position_ids, block_table, active_rows, active_count = admitted
-            if progress_enabled:
-                now = time.perf_counter()
-                if now >= next_progress_time:
-                    window_elapsed = max(now - window_start, 1e-9)
-                    logger.info(
-                        "rollout decode progress: %s step=%d/%d active=%d tokens_per_second=%.1f cache_tokens=%d",
-                        progress_rank,
-                        step,
-                        state.max_new_tokens - 1,
-                        active_count,
-                        window_tokens / window_elapsed,
-                        int(cache_seqlens.max().item()) if active_count else 0,
-                    )
-                    next_progress_time = now + decode_progress_interval_s
-                    window_start = now
-                    window_tokens = 0
         # Any rows still active at this point hit the length cap.
         if active_count > 0:
-            self._emit_rollout_partials(active_rows, generated, response_lens, "length", prompt_indices_list)
+            self._mark_rollout_finished_rows(active_rows, generated, logprobs, response_lens, "length", prompt_indices_list)
         state.metrics["decode_scheduled_tokens"] = float(decoded_tokens)
+        self._record_decode_progress(
+            enabled=progress_enabled,
+            interval_s=decode_progress_interval_s,
+            rollout_key=progress_key,
+            active_count=0,
+            token_delta=0,
+            cache_tokens=0,
+            sample_step=sample_step,
+            max_new_tokens=state.max_new_tokens,
+        )
         if self.device.type == "cuda":
             try:
                 torch.cuda.synchronize(self.device)
@@ -504,6 +484,56 @@ class InferenceManager:
         state.finished = [True for _ in state.generated]
         state.finish_reason = finish_reason_obj
 
+    def _record_decode_progress(
+        self,
+        *,
+        enabled: bool,
+        interval_s: float,
+        rollout_key: int,
+        active_count: int,
+        token_delta: int,
+        cache_tokens: int,
+        sample_step: int,
+        max_new_tokens: int,
+    ) -> None:
+        """Emit one throttled decode-progress line per worker, not per rollout."""
+
+        if not enabled:
+            return
+        ctx = get_tp_context()
+        now = time.perf_counter()
+        with self._decode_progress_lock:
+            if active_count > 0:
+                self._decode_progress_active[rollout_key] = active_count
+            else:
+                self._decode_progress_active.pop(rollout_key, None)
+            self._decode_progress_window_tokens += int(token_delta)
+            if self._decode_progress_next_time <= 0.0:
+                self._decode_progress_window_start = now
+                self._decode_progress_next_time = now + interval_s
+                return
+            if now < self._decode_progress_next_time:
+                return
+            window_elapsed = max(now - self._decode_progress_window_start, 1e-9)
+            window_tokens = int(self._decode_progress_window_tokens)
+            concurrent_rollouts = len(self._decode_progress_active)
+            total_active = sum(self._decode_progress_active.values())
+            self._decode_progress_window_start = now
+            self._decode_progress_next_time = now + interval_s
+            self._decode_progress_window_tokens = 0
+        logger.info(
+            "rollout decode progress: dp=%d/%d concurrent_rollouts=%d active=%d tokens_per_second=%.1f window_tokens=%d step=%d/%d cache_tokens=%d",
+            ctx.dp_rank,
+            ctx.dp_size,
+            concurrent_rollouts,
+            total_active,
+            window_tokens / window_elapsed,
+            window_tokens,
+            sample_step,
+            max_new_tokens,
+            cache_tokens,
+        )
+
     def _cancel_mask_for_active_rows(
         self,
         active_rows: torch.Tensor,
@@ -523,7 +553,16 @@ class InferenceManager:
         local_flags = cancel_flags.index_select(0, cancel_indices).to(self.device, non_blocking=True)
         return local_flags[active_rows] != 0
 
-    def _admit_rollout_additions(
+    def _free_rollout_rows(self, state: InferenceBatchState, rows: torch.Tensor) -> None:
+        """Return the KV blocks owned by `rows` to the free pool."""
+        if rows.numel() == 0:
+            return
+        for row in rows.detach().cpu().tolist():
+            blocks = state._seq_to_blocks.pop(int(row), None)
+            if blocks:
+                state._free_blocks.extend(blocks)
+
+    def _admit_pending_rollout_rows(
         self,
         state: InferenceBatchState,
         generated: torch.Tensor,
@@ -535,21 +574,14 @@ class InferenceManager:
         block_table: torch.Tensor,
         active_rows: torch.Tensor,
         prompt_indices: list[int],
-        session_id: int | None,
         sampling_params: SamplingParams,
         sample_generator: torch.Generator | None,
         eos_token_id: int | tuple[int, ...] | None,
         step: int,
         stop_token_ids: tuple[int, ...],
-        cancel_token: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
-        """Try to admit newly-queued prompts into the running decode batch.
+        """Admit pending rows from the current rollout state only."""
 
-        Returns the new (possibly grown) tuple of decode-state tensors, or
-        None if no admissible prompts are waiting. The grown tensors must be
-        re-bound by the caller to participate in the next decode step.
-        """
-        self._poll_rollout_add_commands(state, prompt_indices, session_id)
         prefill_payload = state.build_prefill_payload()
         if prefill_payload is None:
             return None
@@ -562,23 +594,7 @@ class InferenceManager:
             return_logprobs=True,
         )
         new_tokens, new_logprobs = self._infer_next_token_tensor(prefill)
-        # state._last_active_ids: row indices (within state.prompts) of the
-        # prompts that were just prefilled in this call.
         new_rows = torch.tensor(state._last_active_ids, device=self.device, dtype=torch.long)
-        needed_rows = len(state.prompts)
-        if generated.shape[0] < needed_rows:
-            # Grow the per-row buffers to accommodate the new prompts; cat is
-            # cheaper than reallocating from scratch and keeps existing data.
-            extra_rows = needed_rows - generated.shape[0]
-            generated = torch.cat(
-                [generated, torch.empty(extra_rows, state.max_new_tokens, device=self.device, dtype=generated.dtype)],
-                dim=0,
-            )
-            logprobs = torch.cat(
-                [logprobs, torch.empty(extra_rows, state.max_new_tokens, device=self.device, dtype=logprobs.dtype)],
-                dim=0,
-            )
-            response_lens = torch.cat([response_lens, torch.zeros(extra_rows, device=self.device, dtype=response_lens.dtype)], dim=0)
         generated[new_rows, 0] = new_tokens
         logprobs[new_rows, 0] = new_logprobs
         response_lens[new_rows] = 1
@@ -586,10 +602,8 @@ class InferenceManager:
         new_position_ids = new_cache_seqlens.to(torch.long)
         new_block_table = prefill.block_table.to(self.device, non_blocking=True).int()
         if stop_token_ids:
-            # Prompts whose first sampled token is already a stop token are
-            # emitted and freed before they ever enter the decode batch.
             finished = _tokens_match_any(new_tokens, stop_token_ids)
-            self._emit_rollout_partials(new_rows[finished], generated, response_lens, "stop", prompt_indices)
+            self._mark_rollout_finished_rows(new_rows[finished], generated, logprobs, response_lens, "stop", prompt_indices)
             if bool(finished.any().item()):
                 self._free_rollout_rows(state, new_rows[finished])
                 keep = ~finished
@@ -598,125 +612,32 @@ class InferenceManager:
                 new_cache_seqlens = new_cache_seqlens[keep]
                 new_position_ids = new_position_ids[keep]
                 new_block_table = new_block_table[keep]
-        if next_tokens.numel() == 0:
-            # Batch was idle; the new prompts become the entire active set.
-            active_rows = new_rows
-            active_count = int(new_rows.numel())
-            return generated, logprobs, response_lens, new_tokens, new_cache_seqlens, new_position_ids, new_block_table, active_rows, active_count
-        # Otherwise concat the new rows onto the existing active state.
-        active_rows = torch.cat([active_rows, new_rows])
-        return generated, logprobs, response_lens, torch.cat([next_tokens, new_tokens]), torch.cat([cache_seqlens, new_cache_seqlens]), torch.cat([position_ids, new_position_ids]), torch.cat([block_table, new_block_table]), active_rows, int(active_rows.numel())
+        full_length = response_lens[new_rows] >= state.max_new_tokens
+        if bool(full_length.any().item()):
+            self._mark_rollout_finished_rows(new_rows[full_length], generated, logprobs, response_lens, "length", prompt_indices)
+            self._free_rollout_rows(state, new_rows[full_length])
+            keep = ~full_length
+            new_rows = new_rows[keep]
+            new_tokens = new_tokens[keep]
+            new_cache_seqlens = new_cache_seqlens[keep]
+            new_position_ids = new_position_ids[keep]
+            new_block_table = new_block_table[keep]
+        if new_rows.numel() == 0:
+            return None
+        return generated, logprobs, response_lens, new_tokens, new_cache_seqlens, new_position_ids, new_block_table, new_rows, int(new_rows.numel())
 
-    def _poll_rollout_add_commands(
-        self,
-        state: InferenceBatchState,
-        prompt_indices: list[int],
-        session_id: int | None,
-    ) -> None:
-        """Drain ADD commands from the engine queue and append admissible ones.
-
-        Continuous-batching gate logic:
-          * commands for a different session are dropped;
-          * non-ADD commands are pushed back onto `_deferred_commands` so the
-            outer dispatch loop sees them once rollout finishes;
-          * if the running set is already at `max_running_seqs` or there are
-            not enough free KV blocks to host the new prompt at full
-            `max_new_tokens`, the ADD command is requeued and we exit.
-        """
-        cmd_q = getattr(self, "_cmd_queue", None)
-        if cmd_q is None:
-            return
-        while True:
-            deferred = getattr(self, "_deferred_commands", [])
-            if deferred:
-                cmd = deferred.pop(0)
-            else:
-                try:
-                    cmd = cmd_q.get_nowait()
-                except queue.Empty:
-                    return
-            # Stale ADDs from a previous session are silently dropped.
-            if cmd.op is Op.INFER_ROLLOUT_ADD and cmd.payload.session_id != session_id:
-                continue
-            if cmd.op is not Op.INFER_ROLLOUT_ADD:
-                # Park non-ADD commands so the main dispatcher processes them
-                # after the current rollout returns.
-                getattr(self, "_deferred_commands", []).append(cmd)
-                return
-            ctx = get_tp_context()
-            add_payload: RolloutAddPayload = cmd.payload
-            prompts = add_payload.prompts_by_dp[ctx.dp_rank]
-            indices = add_payload.prompt_indices_by_dp[ctx.dp_rank]
-            if not prompts:
-                continue
-            # Running-set budget gate.
-            if len(state._seq_to_blocks) >= state.max_running_seqs:
-                getattr(self, "_deferred_commands", []).append(cmd)
-                return
-            # KV-block budget gate: worst case = prompt + max_new_tokens.
-            first_prompt = prompts[0]
-            needed_blocks = math.ceil((len(first_prompt) + state.max_new_tokens) / state.kv_block_size)
-            if len(state._free_blocks) < needed_blocks:
-                getattr(self, "_deferred_commands", []).append(cmd)
-                return
-            state.prompts.extend(prompts)
-            state.generated.extend([] for _ in prompts)
-            state.logprobs.extend([] for _ in prompts)
-            state.finished.extend(False for _ in prompts)
-            state.finish_reason.extend("" for _ in prompts)
-            prompt_indices.extend(indices)
-
-    def _free_rollout_rows(self, state: InferenceBatchState, rows: torch.Tensor) -> None:
-        """Return the KV blocks owned by `rows` to the free pool."""
-        if rows.numel() == 0:
-            return
-        for row in rows.detach().cpu().tolist():
-            blocks = state._seq_to_blocks.pop(int(row), None)
-            if blocks:
-                state._free_blocks.extend(blocks)
-
-    def _emit_rollout_partials(
+    def _mark_rollout_finished_rows(
         self,
         rows: torch.Tensor,
         generated: torch.Tensor,
+        logprobs: torch.Tensor,
         response_lens: torch.Tensor,
         finish_reason: str,
         prompt_indices: list[int] | None = None,
     ) -> None:
-        """Send a partial-result message for finished rows to the engine driver.
+        """Finish hook; final rollout output carries completed rows."""
 
-        Only rank 0 publishes results (rest of TP group is a duplicate). Used
-        to stream completions from continuous-serving sessions before the full
-        rollout returns.
-        """
-        ctx = get_tp_context()
-        if not ctx.is_rank0 or rows.numel() == 0:
-            return
-        result_queue = getattr(self, "_result_queue", None)
-        rank = getattr(self, "_rank", None)
-        if result_queue is None or rank is None:
-            return
-        row_values = rows.detach().cpu().tolist()
-        lengths = response_lens[rows].detach().cpu().tolist()
-        generated_rows = generated[rows].detach().cpu().tolist()
-        response_ids = [row[: int(length)] for row, length in zip(generated_rows, lengths, strict=True)]
-        prompt_index_values = [prompt_indices[int(row)] for row in row_values] if prompt_indices is not None else None
-        result_queue.put(
-            (
-                rank,
-                WorkerResult(
-                    ok=True,
-                    payload=RolloutPartialPayload(
-                        dp_rank=ctx.dp_rank,
-                        rows=row_values,
-                        response_ids=response_ids,
-                        finish_reason=[finish_reason for _ in response_ids],
-                        prompt_indices=prompt_index_values,
-                    ),
-                    final=False,
-                ),
-            )
-        )
+        del rows, generated, logprobs, response_lens, finish_reason, prompt_indices
 
     @torch.inference_mode()
     def _infer_next_token_tensor(self, payload: PrefillPayload) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:

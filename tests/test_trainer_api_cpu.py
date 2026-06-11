@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import asyncio
 
 from areno.api.trainer import Trainer
 import areno.api.trainer as trainer_mod
@@ -90,6 +91,18 @@ class TrainerPromptBatchTest(unittest.TestCase):
             def __init__(self):
                 self.prompt_tokens = None
 
+            def begin_rollout_session(self, _ctx):
+                return None
+
+            def end_rollout_session(self, _ctx):
+                return None
+
+            async def begin_rollout_session_async(self, _ctx):
+                self.begin_rollout_session(_ctx)
+
+            async def end_rollout_session_async(self, _ctx):
+                self.end_rollout_session(_ctx)
+
             def rollout_batch(self, _ctx, prompt_tokens, n_samples, _sampling_params):
                 self.prompt_tokens = prompt_tokens
                 self.n_samples = n_samples
@@ -100,7 +113,11 @@ class TrainerPromptBatchTest(unittest.TestCase):
         trainer._backend = backend
         trainer._ctx = Context(1, "unused", object())
 
-        result = trainer.rollout_token_batch([[1, 2], [3]], 4, SamplingParams())
+        async def run_rollout():
+            async with trainer.rollout_session(sampling_params=SamplingParams(), proxy=False):
+                return trainer.rollout_token_batch([[1, 2], [3]], 4, SamplingParams())
+
+        result = asyncio.run(run_rollout())
 
         self.assertEqual(result, [])
         self.assertEqual(backend.prompt_tokens, [[1, 2], [3]])
@@ -110,6 +127,18 @@ class TrainerPromptBatchTest(unittest.TestCase):
         """The trainer, not the backend, owns step increments across rollout/train."""
 
         class BackendStub:
+            def begin_rollout_session(self, _ctx):
+                return None
+
+            def end_rollout_session(self, _ctx):
+                return None
+
+            async def begin_rollout_session_async(self, _ctx):
+                self.begin_rollout_session(_ctx)
+
+            async def end_rollout_session_async(self, _ctx):
+                self.end_rollout_session(_ctx)
+
             def rollout_batch(self, _ctx, _prompt_tokens, _n_samples, _sampling_params):
                 return []
 
@@ -120,13 +149,31 @@ class TrainerPromptBatchTest(unittest.TestCase):
         trainer._backend = BackendStub()
         trainer._ctx = Context(1, "unused", object())
 
-        trainer.rollout_token_batch([[1]], 1, SamplingParams())
-        trainer.rollout_token_batch([[2]], 1, SamplingParams())
+        async def run_rollout(prompt_tokens):
+            async with trainer.rollout_session(sampling_params=SamplingParams(), proxy=False):
+                trainer.rollout_token_batch(prompt_tokens, 1, SamplingParams())
+
+        asyncio.run(run_rollout([[1]]))
+        asyncio.run(run_rollout([[2]]))
 
         self.assertEqual(trainer._ctx.global_step, 0)
         trainer.train([], lambda _pack, _logprobs: None, mini_bs=1)
-        trainer.rollout_token_batch([[3]], 1, SamplingParams())
+        asyncio.run(run_rollout([[3]]))
         self.assertEqual(trainer._ctx.global_step, 1)
+
+    def test_rollout_token_batch_requires_explicit_session(self):
+        """Rollout callers must own the rollout session lifecycle explicitly."""
+
+        class BackendStub:
+            def rollout_batch(self, _ctx, _prompt_tokens, _n_samples, _sampling_params):
+                return []
+
+        trainer = Trainer(world_size=1, model_path="unused")
+        trainer._backend = BackendStub()
+        trainer._ctx = Context(1, "unused", object())
+
+        with self.assertRaisesRegex(RuntimeError, "rollout_session"):
+            trainer.rollout_token_batch([[1]], 1, SamplingParams())
 
     def test_train_without_rollout_opens_context_step(self):
         """Train-only algorithms should still record their first update as step 0."""

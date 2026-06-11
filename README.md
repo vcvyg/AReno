@@ -15,9 +15,9 @@ and maintained by the AReno community.
 
 ## AReno: ASystem Reinforcement Learning Nano
 
-AReno is a reinforcement learning (RL) toolkit that lets you train and run models locally. It was originally developed by engineers from the ASystem Team at Ant Group.
+AReno is a local LLM post-training toolkit for RL, SFT/DPO-style training, serving, and agentic RL. It was originally developed by engineers from the ASystem Team at Ant Group.
 
-Built on a **self-contained, full-stack design**, AReno is optimized to extract maximum performance from a single node, making it well-suited for **fast, local RL post-training** with no external training or inference backend in the loop.
+Built on a **self-contained, full-stack design**, AReno is optimized to extract maximum performance from a single node, making it well-suited for **fast, local post-training** with no external training or inference backend in the loop.
 
 AReno's mission is to make LLM RL **accessible** for a broad community of researchers and developers — so you can go from a base checkpoint to a trained, served model on a single node, without standing up a cluster or wiring together a training framework, an inference server, and a kernel library.
 
@@ -27,8 +27,9 @@ AReno's mission is to make LLM RL **accessible** for a broad community of resear
 
 ## Highlights
 
-- ✨ **Plug-and-play**: various fine-tuning methods are easily accessible via the `--algo` flag or the same `Trainer` class from Python, no cluster or launcher to set up.
+- ✨ **Plug-and-play**: various post-training methods are easily accessible via the `--algo` flag or the same `Trainer` class from Python, no cluster or launcher to set up.
 - 🪶 **Lightweight**: single self-contained package, no external training/inference backend, just PyTorch, FlashAttention, and a handful of other libraries.
+- 🧰 **Agentic RL ready**: run an agent function against AReno's local OpenAI-compatible proxy, record agent traces with tokens, logprobs, rewards, and loss masks, then train from the collected rollouts.
 - 🧩 **Extensible**: easily register new algorithms, model adapters, reward functions, and hardware backends without changing the core.
 
 ## Installation
@@ -48,15 +49,12 @@ AReno's mission is to make LLM RL **accessible** for a broad community of resear
 **To install:**
 
 ```bash
-pip install "git+https://github.com/inclusionAI/asystem-areno.git" --no-build-isolation
+pip install areno --no-build-isolation
 pip install flash-attn flash-linear-attention
 ```
 
 `--no-build-isolation` is required so that pip uses your existing CUDA-enabled
 PyTorch instead of installing a CPU-only torch in an isolated build environment.
-
-> Prebuilt PyPI wheels (`pip install areno`) are coming. Until then, install
-> from the repository as shown above.
 
 **From source** (recommended if you want the examples or plan to contribute):
 
@@ -186,6 +184,7 @@ You can use the AReno Command Line Interface (CLI) to quickly get started with p
 areno train \
   --ckpt Qwen/Qwen3-0.6B \
   --dataset-path gsm8k:main \
+  --dataset-loader-fn examples/math/dataset_loader.py \
   --reward-fn-path examples/math/math_verify_reward.py \
   --algo gspo \
   --tp-size 4
@@ -206,6 +205,30 @@ areno serve \
 This starts a server with continuous batching; point any OpenAI client at
 `http://localhost:8000/v1/chat/completions`. Run `areno train --help` or
 `areno serve --help` for the full option surface.
+
+Run an agentic rollout task by adding an agent function. The agent calls the
+local OpenAI-compatible endpoint, including `tools` and `tool_choice` when
+needed, while AReno records trainable assistant outputs and masks tool results
+by default:
+
+```bash
+python examples/agentic/tictactoe/dataset_generator.py \
+  --output /tmp/areno-tictactoe.jsonl \
+  --count 2048 \
+  --seed 2026
+```
+
+```bash
+areno train \
+  --ckpt Qwen/Qwen3-0.6B \
+  --dataset-path /tmp/areno-tictactoe.jsonl \
+  --dataset-loader-fn examples/agentic/tictactoe/dataset_loader.py \
+  --reward-fn-path examples/agentic/tictactoe/reward.py \
+  --agent-fn examples/agentic/tictactoe/run_agent.py \
+  --algo gspo \
+  --tp-size 1 \
+  --world-size 1
+```
 
 ## Development
 

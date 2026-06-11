@@ -66,6 +66,7 @@ class TrainSequence(BaseModel):
     """
 
     prompt_mask: list[bool] = Field(default_factory=list)
+    loss_mask: list[bool] = Field(default_factory=list)
     tokens: list[int] = Field(default_factory=list)
     logprobs: list[float] = Field(default_factory=list)
     advantages: list[float] = Field(default_factory=list)

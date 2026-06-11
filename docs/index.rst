@@ -7,10 +7,11 @@ areno
 
    <div class="hero">
      <h1>areno</h1>
-     <p>A lightweight CUDA-native post-training and inference stack for local LLMs. areno keeps rollout, inference, scoring, and training inside one engine for a compact train-infer workflow.</p>
+     <p>A lightweight CUDA-native stack for local LLM post-training and serving, including agentic RL. areno brings rollout, scoring, inference, and optimizer steps into one engine, so post-training loops stay compact and fast.</p>
      <div class="badges">
        <span class="badge">Lightweight runtime</span>
        <span class="badge">Unified train-infer engine</span>
+       <span class="badge">Agentic rollouts</span>
        <span class="badge">Minimal dependencies</span>
        <span class="badge">SFT / DPO / GSPO / GRPO / PPO</span>
      </div>
@@ -18,10 +19,11 @@ areno
 
 .. raw:: html
 
-   <div class="card-grid">
-     <div class="feature-card"><strong>Lightweight by design</strong><p>The core stack stays small: PyTorch plus focused CUDA/attention dependencies, without a separate serving framework or trainer framework in the hot path.</p></div>
-     <div class="feature-card"><strong>Train and infer together</strong><p>Rollout, scoring, optimizer steps, CUDA graph handling, and checkpoint I/O live in one local engine for a direct post-training loop.</p></div>
-     <div class="feature-card"><strong>Kernel-first runtime</strong><p>Fused CUDA paths cover routing, token movement, top-k, embedding, activation, normalization, and MoE hot paths.</p></div>
+   <div class="areno-feature-grid">
+     <div class="areno-feature-card"><strong>Lightweight by design</strong><p>The core stack stays small: PyTorch plus focused CUDA/attention dependencies, without a separate serving framework or trainer framework in the hot path.</p></div>
+     <div class="areno-feature-card"><strong>Train and infer together</strong><p>Rollout, scoring, optimizer steps, CUDA graph handling, agentic proxying, and checkpoint I/O live in one local engine for a direct post-training loop.</p></div>
+     <div class="areno-feature-card"><strong>Kernel-first runtime</strong><p>Fused CUDA paths cover routing, token movement, top-k, embedding, activation, normalization, and MoE hot paths.</p></div>
+     <div class="areno-feature-card"><strong>Agentic by default</strong><p>Agent functions can call a local OpenAI-compatible proxy; areno records completions, tokens, logprobs, rewards, and loss masks for training.</p></div>
    </div>
 
 Quick start
@@ -57,6 +59,27 @@ Start an OpenAI-compatible server:
      --world-size 1 \
      --port 8000
 
+Run an agentic rollout task:
+
+.. code-block:: bash
+
+   python examples/agentic/tictactoe/dataset_generator.py \
+     --output /tmp/areno-tictactoe.jsonl \
+     --count 2048 \
+     --seed 2026
+
+.. code-block:: bash
+
+   areno train \
+     --ckpt Qwen/Qwen3-0.6B \
+     --dataset-path /tmp/areno-tictactoe.jsonl \
+     --dataset-loader-fn examples/agentic/tictactoe/dataset_loader.py \
+     --reward-fn-path examples/agentic/tictactoe/reward.py \
+     --agent-fn examples/agentic/tictactoe/run_agent.py \
+     --algo gspo \
+     --tp-size 1 \
+     --world-size 1
+
 What areno owns
 ---------------
 
@@ -71,7 +94,7 @@ What areno owns
    * - Engine
      - Tensor-parallel workers, KV/cache layout, CUDA graph support, rollout state, scoring, optimizer steps, and checkpoint I/O.
    * - Algorithms
-     - SFT, DPO, GSPO, GRPO, and PPO are implemented inside the project rather than delegated to a separate trainer framework.
+     - SFT, DPO, GSPO, GRPO, PPO, and agentic rollouts are implemented inside the project rather than delegated to a separate trainer framework.
    * - Checkpoints
      - Hugging Face-compatible load/save adapters for supported model families.
 

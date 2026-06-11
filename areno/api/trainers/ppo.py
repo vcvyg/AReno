@@ -241,6 +241,132 @@ class PPOTrainer(PolicyOnlyTrainer):
             self._last_ppo_stats.update(_summary_stats("normalized_advantage", normalized_advantages))
         return train_batch, rewards_all, rollout_logprobs
 
+    def _materialize_agentic_train_batch(self, tokenizer, prompt_batch, agent_batch):
+        del prompt_batch
+        self._last_ppo_stats = {}
+        train_batch = []
+        rollout_logprobs = []
+        ref_logprobs_all = []
+        critic_values_all = []
+        returns_all = []
+        advantages_all = []
+        token_rows = agent_batch.token_rows
+
+        if agent_batch.rewards is not None:
+            rewards_all = [float(reward) for reward in agent_batch.rewards]
+        else:
+            self.logger.info("role=reward stage=score_start rows=%d", len(token_rows))
+            reward_start = time.perf_counter()
+            rewards_all = [float(reward) for reward in self._score_rewards(token_rows)]
+            self._last_ppo_stats.update(_summary_stats("reward_model_raw_reward", rewards_all))
+            self._last_ppo_stats["reward_score_time_s"] = time.perf_counter() - reward_start
+            self.logger.info("role=reward stage=score_end rows=%d", len(token_rows))
+
+        self.logger.info("role=ref stage=logprob_score_start rows=%d", len(token_rows))
+        ref_start = time.perf_counter()
+        ref_logprob_rows = self._score_logprobs("ref", token_rows)
+        self._last_ppo_stats["ref_logprob_forward_time_s"] = time.perf_counter() - ref_start
+        self.logger.info("role=ref stage=logprob_score_end rows=%d", len(token_rows))
+        self.logger.info("role=actor stage=old_logprob_score_start rows=%d", len(token_rows))
+        actor_logprob_start = time.perf_counter()
+        old_logprob_rows = self._score_logprobs("actor", token_rows)
+        self._last_ppo_stats["actor_old_logprob_forward_time_s"] = time.perf_counter() - actor_logprob_start
+        self.logger.info("role=actor stage=old_logprob_score_end rows=%d", len(token_rows))
+        self.logger.info("role=critic stage=value_score_start rows=%d", len(token_rows))
+        critic_value_start = time.perf_counter()
+        value_rows = self._score_values("critic", token_rows)
+        self._last_ppo_stats["critic_value_forward_time_s"] = time.perf_counter() - critic_value_start
+        self.logger.info("role=critic stage=value_score_end rows=%d", len(token_rows))
+
+        old_logprobs_all = []
+        logp_diff_all = []
+        for tokens, response_mask, loss_mask, rollout_row, reward, ref_logprobs, old_logprobs, values in zip(
+            token_rows,
+            agent_batch.response_masks,
+            agent_batch.loss_masks,
+            agent_batch.rollout_logprobs,
+            rewards_all,
+            ref_logprob_rows,
+            old_logprob_rows,
+            value_rows,
+            strict=True,
+        ):
+            if not (len(tokens) == len(response_mask) == len(loss_mask) == len(rollout_row)):
+                raise ValueError("agentic PPO batch has misaligned token/mask/logprob rows")
+            response_indices = [idx for idx, is_response in enumerate(response_mask) if is_response]
+            loss_indices = [idx for idx in response_indices if loss_mask[idx]]
+            if not loss_indices:
+                continue
+            prefix_len = response_indices[0]
+            resp_len = len(response_indices)
+            action_old_logprobs = old_logprobs[prefix_len : prefix_len + resp_len]
+            if len(action_old_logprobs) != resp_len:
+                raise ValueError("actor returned misaligned old logprobs")
+            row_rollout_logprobs = rollout_row[prefix_len : prefix_len + resp_len]
+            rollout_logprobs.extend(lp for lp, is_loss in zip(row_rollout_logprobs, loss_mask[prefix_len : prefix_len + resp_len], strict=True) if is_loss)
+            old_logprobs_all.extend(action_old_logprobs)
+            logp_diff_all.extend(
+                float(old_logprob) - float(rollout_logprob)
+                for old_logprob, rollout_logprob in zip(action_old_logprobs, row_rollout_logprobs, strict=True)
+            )
+            token_rewards = [0.0 for _ in range(resp_len)]
+            token_rewards[-1] = float(reward)
+            action_values = values[prefix_len - 1 : prefix_len + resp_len - 1]
+            if len(action_values) != resp_len:
+                raise ValueError("critic returned misaligned token values")
+            advantages, returns = self._gae_for_response(token_rewards, action_values)
+            full_advantages = [0.0] * len(tokens)
+            full_returns = [0.0] * len(tokens)
+            full_values = [0.0] * len(tokens)
+            for rel_idx, tok_idx in enumerate(response_indices):
+                if loss_mask[tok_idx]:
+                    full_advantages[tok_idx] = advantages[rel_idx]
+                full_returns[tok_idx] = returns[rel_idx]
+                full_values[tok_idx] = action_values[rel_idx]
+            prompt_mask = [not item for item in response_mask]
+            ref_logprobs_all.extend(ref_logprobs[prefix_len : prefix_len + resp_len])
+            critic_values_all.extend(action_values)
+            returns_all.extend(returns)
+            advantages_all.extend(advantages)
+            train_batch.append(
+                areno.api.TrainSequence(
+                    prompt_mask=prompt_mask,
+                    loss_mask=loss_mask,
+                    tokens=tokens,
+                    logprobs=[0.0] * prefix_len + action_old_logprobs,
+                    advantages=full_advantages,
+                    returns=full_returns,
+                    values=full_values,
+                    ref_logprobs=ref_logprobs,
+                    reward=float(reward),
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            )
+
+        if train_batch:
+            self.logger.info("role=critic stage=train_start rows=%d", len(train_batch))
+            critic_train_start = time.perf_counter()
+            critic_stats = self._train_values(train_batch)
+            self._last_ppo_stats["critic_train_time_s"] = time.perf_counter() - critic_train_start
+            self.logger.info("role=critic stage=train_end rows=%d", len(train_batch))
+            if critic_stats:
+                self._last_ppo_stats.update({key: float(value) for key, value in critic_stats.items()})
+            self._last_ppo_stats.update(_summary_stats("ref_logprob", ref_logprobs_all))
+            self._last_ppo_stats.update(_summary_stats("old_logprob", old_logprobs_all))
+            self._last_ppo_stats.update(_summary_stats("old_rollout_logprob_diff", logp_diff_all))
+            self._last_ppo_stats.update(_summary_stats("critic_value", critic_values_all))
+            self._last_ppo_stats.update(_summary_stats("return", returns_all))
+            self._last_ppo_stats.update(_summary_stats("gae_advantage", advantages_all))
+            _normalize_response_advantages(train_batch)
+            normalized_advantages = [
+                adv
+                for seq in train_batch
+                for adv, is_loss in zip(seq.advantages, seq.loss_mask, strict=True)
+                if is_loss
+            ]
+            self._last_ppo_stats.update(_summary_stats("normalized_advantage", normalized_advantages))
+        return train_batch, rewards_all, rollout_logprobs
+
     def _ensure_roles(self) -> None:
         # Surfaces a structured log per role so initialisation order is easy
         # to follow when something fails mid-load.
@@ -338,7 +464,8 @@ def _normalize_response_advantages(train_batch) -> None:
 
     values = []
     for seq in train_batch:
-        values.extend(adv for adv, is_prompt in zip(seq.advantages, seq.prompt_mask, strict=True) if not is_prompt)
+        mask = seq.loss_mask if getattr(seq, "loss_mask", None) else [not item for item in seq.prompt_mask]
+        values.extend(adv for adv, is_loss in zip(seq.advantages, mask, strict=True) if is_loss)
     if not values:
         return
     mean = float(np.mean(values))
@@ -346,9 +473,10 @@ def _normalize_response_advantages(train_batch) -> None:
     # Guard against degenerate batches where every advantage equals the mean.
     scale = std if std > 1e-6 else 1.0
     for seq in train_batch:
+        mask = seq.loss_mask if getattr(seq, "loss_mask", None) else [not item for item in seq.prompt_mask]
         seq.advantages = [
-            0.0 if is_prompt else (adv - mean) / scale
-            for adv, is_prompt in zip(seq.advantages, seq.prompt_mask, strict=True)
+            (adv - mean) / scale if is_loss else 0.0
+            for adv, is_loss in zip(seq.advantages, mask, strict=True)
         ]
 
 

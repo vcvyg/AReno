@@ -3,7 +3,7 @@
 Each `ArenoWorker` owns one tensor-parallel shard of the model on a single
 device and drives the four lifecycle phases of an RL step:
 
-* rollout (prefill + paged-KV decode) with continuous batching;
+* rollout (prefill + paged-KV decode);
 * reference / critic / reward scoring via swap-in `WorkerRole`s;
 * training step (FP32 master weights, packed or padded);
 * KV-cache lifecycle (allocate, reset, scratch block, CUDA-graph capture)
@@ -86,6 +86,10 @@ class ArenoWorker:
             return self.ensure_roles(cmd.payload)
         if cmd.op is Op.INFER_ROLLOUT:
             return self.infer_rollout(cmd.payload)
+        if cmd.op is Op.ROLLOUT_SESSION_BEGIN:
+            return self.rollout_session_begin(cmd.payload)
+        if cmd.op is Op.ROLLOUT_SESSION_END:
+            return self.rollout_session_end(cmd.payload)
         if cmd.op is Op.TRAIN:
             return self.train(cmd.payload)
         if cmd.op is Op.SCORE_LOGPROBS:
@@ -107,6 +111,20 @@ class ArenoWorker:
     def infer_rollout(self, payload: dict) -> RolloutOutput | None:
         """Delegate rollout generation to `InferenceManager`."""
         return self.inference.infer_rollout(payload)
+
+    def rollout_session_begin(self, payload: None) -> None:
+        """Prepare actor state for one or more rollout calls."""
+
+        del payload
+        self._prepare_actor_onloaded()
+
+    def rollout_session_end(self, payload: None) -> None:
+        """Finalize rollout state before scoring or training starts."""
+
+        del payload
+        if not self.config.runtime.keep_rollout_state:
+            self._drop_rollout_hbm()
+        self._prepare_for_train()
 
     def _prepare_for_train(self) -> None:
         """Ensure the actor is on-device and train weights are loaded."""

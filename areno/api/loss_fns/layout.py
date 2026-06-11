@@ -135,6 +135,8 @@ def _padded_response_layout(
 ) -> ResponseLayout:
     device = logprobs.device
     response_mask = (~data_pack["prompt_mask"][:, 1:]).to(device=device, dtype=torch.float32)
+    if "loss_mask" in data_pack:
+        response_mask = response_mask * data_pack["loss_mask"][:, 1:].to(device=device, dtype=torch.float32)
     valid_count = response_mask.sum().clamp(min=1)
     response_len = response_mask.sum(dim=-1).clamp(min=1)
 

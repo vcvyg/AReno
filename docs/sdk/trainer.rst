@@ -19,6 +19,7 @@ directly from Python.
    * create a local tensor-parallel Areno backend
    * load prompt batches from dataset-like objects
    * generate text rollouts from string prompts or token ids
+   * run agentic rollouts through a local OpenAI-compatible proxy
    * train policy batches with caller-provided loss functions
    * prepare reference, reward, and critic roles for PPO/DPO workflows
    * score logprobs, values, and rewards through backend-owned roles
@@ -28,28 +29,35 @@ directly from Python.
 
    .. code-block:: python
 
+      import asyncio
       import areno
       from areno import Trainer
 
-      # Near-instant: constructs the Python wrapper only.
-      trainer = Trainer(
-          world_size=1,
-          model_path="Qwen/Qwen3.5-4B",
-          backend_type=areno.Areno,
-          custom_config=areno.ArenoConfig(tp_size=1),
-      )
+      async def main():
+          # Near-instant: constructs the Python wrapper only.
+          trainer = Trainer(
+              world_size=1,
+              model_path="Qwen/Qwen3.5-4B",
+              backend_type=areno.Areno,
+              custom_config=areno.ArenoConfig(tp_size=1),
+          )
 
-      # Takes a moment: loads tokenizer, starts workers, loads checkpoint.
-      trainer.init()
+          # Takes a moment: loads tokenizer, starts workers, loads checkpoint.
+          trainer.init()
 
-      # Fast relative to startup: rollout uses already-initialized workers.
-      rollout = trainer.rollout_batch(["Solve 12 * 13."], n_samples=1, sampling_params=areno.SamplingParams())
+          # Rollout calls must run inside an explicit rollout session. The
+          # session owns actor onload/offload and rollout-state cleanup.
+          sampling = areno.SamplingParams(max_new_tokens=128)
+          async with trainer.rollout_session(sampling_params=sampling, proxy=False):
+              rollout = trainer.rollout_batch(["Solve 12 * 13."], n_samples=1, sampling_params=sampling)
 
-      # Runs one backend optimizer step.
-      stats = trainer.train(batch_data, loss_fn, mini_bs=1)
+          # Runs one backend optimizer step.
+          stats = trainer.train(batch_data, loss_fn, mini_bs=1)
 
-      # Release metric writers and local resources.
-      trainer.close()
+          # Release metric writers and local resources.
+          trainer.close()
+
+      asyncio.run(main())
 
    .. note::
 
@@ -133,6 +141,11 @@ directly from Python.
 
       Generate completions from text prompts.
 
+      Must be called inside ``async with trainer.rollout_session(...,
+      proxy=False)`` for direct prompt rollouts. The explicit session defines
+      the rollout lifecycle and prevents accidental consecutive rollouts from
+      leaving stale rollout state.
+
       :param list[str] prompts: Prompt strings.
       :param int n_samples: Number of completions per prompt.
       :param SamplingParams sampling_params: Generation controls.
@@ -145,15 +158,20 @@ directly from Python.
 
          from areno import SamplingParams
 
-         rollouts = trainer.rollout_batch(
-             ["Solve 12 * 13."],
-             n_samples=4,
-             sampling_params=SamplingParams(max_new_tokens=128, temperature=1.0),
-         )
+         sampling = SamplingParams(max_new_tokens=128, temperature=1.0)
+         async with trainer.rollout_session(sampling_params=sampling, proxy=False):
+             rollouts = trainer.rollout_batch(
+                 ["Solve 12 * 13."],
+                 n_samples=4,
+                 sampling_params=sampling,
+             )
 
    .. py:method:: rollout_token_batch(prompt_tokens, n_samples, sampling_params)
 
       Generate completions from pre-tokenized prompts.
+
+      Must be called inside an explicit rollout session, same as
+      :meth:`rollout_batch`.
 
       :param list[list[int]] prompt_tokens: Prompt token ids.
       :param int n_samples: Number of completions per prompt.
@@ -167,11 +185,45 @@ directly from Python.
 
          tokenizer = trainer.get_tokenizer()
          prompt_tokens = [tokenizer.encode("Solve 12 * 13.")]
-         rollouts = trainer.rollout_token_batch(
-             prompt_tokens,
-             n_samples=4,
-             sampling_params=SamplingParams(max_new_tokens=128, temperature=1.0),
-         )
+         sampling = SamplingParams(max_new_tokens=128, temperature=1.0)
+         async with trainer.rollout_session(sampling_params=sampling, proxy=False):
+             rollouts = trainer.rollout_token_batch(
+                 prompt_tokens,
+                 n_samples=4,
+                 sampling_params=sampling,
+             )
+
+   .. py:method:: rollout_session(*, sampling_params, loss_mask_policy=None, max_running_prompts=None, timeout_s=300.0, proxy=True)
+
+      Create an async rollout session.
+
+      The session is the required lifecycle boundary for rollout. On enter, it
+      prepares actor rollout state. On exit, it finalizes rollout-only state
+      and prepares the backend for scoring or training. For direct prompt
+      rollout, pass ``proxy=False``. For agentic rollout, keep the default
+      ``proxy=True`` so the session starts a local OpenAI-compatible proxy.
+
+      In proxy mode, agent code calls ``ctx.get_base_url()`` with a standard
+      OpenAI client, and Areno collects assistant text, assistant tool calls,
+      token ids, rollout logprobs, reward records, and loss masks. Assistant
+      text and assistant tool-call spans are trainable by default; tool-result
+      spans are masked unless enabled through ``LossMaskPolicy``.
+
+      :param SamplingParams sampling_params: Default generation controls.
+      :param LossMaskPolicy | None loss_mask_policy: Optional span-level loss
+         mask policy.
+      :param int | None max_running_prompts: Global concurrent prompt budget.
+      :param float timeout_s: Proxy request and collection timeout.
+      :param bool proxy: Whether to start the local OpenAI-compatible proxy.
+      :returns: async ``RolloutSession`` context manager.
+
+      .. code-block:: python
+
+         async with trainer.rollout_session(
+             sampling_params=SamplingParams(max_new_tokens=32, temperature=0.7),
+             max_running_prompts=64,
+         ) as ctx:
+             print(ctx.get_base_url())
 
    .. py:method:: train(batch_data, loss_fn, mini_bs=8, gradient_accumulation_steps=None)
 
@@ -343,11 +395,42 @@ Data classes
    :param float decode_progress_interval_s: Worker decode progress log
       interval.
 
+.. py:class:: areno.api.agentic.AgentBatch(records, prompts, input_tokens, n_samples)
+
+   Prompt batch expanded into one item per prompt/sample pair for agent
+   execution.
+
+   :param list[dict] records: Source dataset records.
+   :param list[str] prompts: Prompt strings.
+   :param list[list[int]] input_tokens: Prompt token ids.
+   :param int n_samples: Samples per prompt.
+
+.. py:class:: areno.api.agentic.RewardRecord(...)
+
+   Unified reward input for agentic rollouts.
+
+   Reward functions receive one ``RewardRecord`` per completed trajectory. The
+   record includes ``prompt``, ``completion``, ``messages``, ``trace``,
+   ``tool_calls``, ``tokens``, ``logprobs``, ``loss_mask``, ``source_record``,
+   and ``metadata``.
+
+.. py:class:: areno.api.agentic.LossMaskPolicy(assistant_text=True, assistant_tool_calls=True, tool_results=False, final_assistant_text=True, system_prompt=False, user_prompt=False)
+
+   Span-level policy-loss controls for agentic trajectories.
+
+   :param bool assistant_text: Train assistant text spans.
+   :param bool assistant_tool_calls: Train assistant tool-call spans.
+   :param bool tool_results: Train tool-result spans. Defaults to ``False``.
+   :param bool final_assistant_text: Reserved for final-response text spans.
+   :param bool system_prompt: Reserved for system prompt spans.
+   :param bool user_prompt: Reserved for user prompt spans.
+
 One GSPO-style rollout/train step
 ---------------------------------
 
 .. code-block:: python
 
+   import asyncio
    from functools import partial
 
    from datasets import load_dataset
@@ -364,46 +447,134 @@ One GSPO-style rollout/train step
        return [(reward - mean) / std for reward in rewards]
 
 
+   async def main():
+       trainer = Trainer(
+           world_size=1,
+           model_path="Qwen/Qwen3.5-4B",
+           backend_type=areno.Areno,
+           custom_config=areno.ArenoConfig(tp_size=1),
+       )
+       trainer.init()
+
+       row = load_dataset("gsm8k", "main", split="train[0:1]")[0]
+       target = str(row["answer"]).rsplit("####", 1)[-1].strip()
+       prompt = (
+           "Solve the problem and put the final answer in \\boxed{}.\n\n"
+           f"Problem: {row['question']}\nSolution:"
+       )
+       prompt_tokens = trainer.get_tokenizer().encode(prompt)
+       sampling = SamplingParams(max_new_tokens=128, temperature=1.0)
+
+       async with trainer.rollout_session(sampling_params=sampling, proxy=False):
+           rollout = trainer.rollout_token_batch([prompt_tokens], n_samples=4, sampling_params=sampling)[0]
+
+       completions = [trainer.get_tokenizer().decode(seq.resp_tokens) for seq in rollout.sequences]
+       rewards = [1.0 if target in completion else 0.0 for completion in completions]
+       advantages = normalize_rewards(rewards)
+
+       batch = []
+       for seq, reward, advantage in zip(rollout.sequences, rewards, advantages, strict=True):
+           response_len = len(seq.resp_tokens)
+           batch.append(
+               TrainSequence(
+                   prompt_mask=[True] * len(prompt_tokens) + [False] * response_len,
+                   tokens=prompt_tokens + seq.resp_tokens,
+                   logprobs=[0.0] * len(prompt_tokens) + seq.resp_logprobs,
+                   advantages=[0.0] * len(prompt_tokens) + [advantage] * response_len,
+                   reward=reward,
+                   eos_token_id=trainer.get_tokenizer().eos_token_id,
+               )
+           )
+       )
+
+       stats = trainer.train(batch, partial(gspo_loss_fn, clip_eps=3.0e-4), mini_bs=4)
+       print(stats)
+       trainer.close()
+
+   asyncio.run(main())
+
+Agentic rollout with tools
+--------------------------
+
+This example shows the SDK pieces used by ``--agent-fn``. The agent calls a
+local OpenAI-compatible proxy with Chat Completions ``tools``. Areno parses
+model-native tool-call output for supported model families and returns an
+``AgentTrainBatch`` that can be passed to the same trainers/loss functions as
+regular rollouts.
+
+.. code-block:: python
+
+   import asyncio
+
+   import areno
+   from areno import SamplingParams, Trainer
+   from areno.api.agentic import AgentBatch
+   from openai import AsyncOpenAI
+
+
+   tools = [
+       {
+           "type": "function",
+           "function": {
+               "name": "choose_move",
+               "parameters": {
+                   "type": "object",
+                   "properties": {
+                       "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                   },
+                   "required": ["direction"],
+               },
+           },
+       }
+   ]
+
+
+   async def run_agent(ctx, batch):
+       client = AsyncOpenAI(base_url=ctx.get_base_url(), api_key=ctx.api_key, max_retries=0)
+
+       async def run_one(item):
+           await client.chat.completions.create(
+               model="policy",
+               messages=[
+                   {"role": "system", "content": "Call choose_move with the selected direction."},
+                   {"role": "user", "content": item.prompt},
+               ],
+               tools=tools,
+               tool_choice={"type": "function", "function": {"name": "choose_move"}},
+               max_tokens=16,
+               temperature=0.7,
+           )
+
+       try:
+           await asyncio.gather(*(run_one(item) for item in batch.iter_samples()))
+       finally:
+           await client.close()
+
+
+   def reward_fn(record):
+       if not record.tool_calls:
+           return -1.0
+       return 1.0
+
+
+   async def collect_agentic_batch(trainer, prompt_batch):
+       agent_batch = AgentBatch.from_prompt_batch(prompt_batch, n_samples=4)
+       async with trainer.rollout_session(
+           sampling_params=SamplingParams(max_new_tokens=16, temperature=0.7),
+           max_running_prompts=len(agent_batch),
+       ) as ctx:
+           ctx.attach_batch(agent_batch)
+           await run_agent(ctx, agent_batch)
+           return await ctx.get_train_batch(reward_fn=reward_fn)
+
+
    trainer = Trainer(
        world_size=1,
-       model_path="Qwen/Qwen3.5-4B",
+       model_path="Qwen/Qwen3-0.6B",
        backend_type=areno.Areno,
        custom_config=areno.ArenoConfig(tp_size=1),
    )
    trainer.init()
 
-   row = load_dataset("gsm8k", "main", split="train[0:1]")[0]
-   target = str(row["answer"]).rsplit("####", 1)[-1].strip()
-   prompt = (
-       "Solve the problem and put the final answer in \\boxed{}.\n\n"
-       f"Problem: {row['question']}\nSolution:"
-   )
-   prompt_tokens = trainer.get_tokenizer().encode(prompt)
-
-   rollout = trainer.rollout_token_batch(
-       [prompt_tokens],
-       n_samples=4,
-       sampling_params=SamplingParams(max_new_tokens=128, temperature=1.0),
-   )[0]
-
-   completions = [trainer.get_tokenizer().decode(seq.resp_tokens) for seq in rollout.sequences]
-   rewards = [1.0 if target in completion else 0.0 for completion in completions]
-   advantages = normalize_rewards(rewards)
-
-   batch = []
-   for seq, reward, advantage in zip(rollout.sequences, rewards, advantages, strict=True):
-       response_len = len(seq.resp_tokens)
-       batch.append(
-           TrainSequence(
-               prompt_mask=[True] * len(prompt_tokens) + [False] * response_len,
-               tokens=prompt_tokens + seq.resp_tokens,
-               logprobs=[0.0] * len(prompt_tokens) + seq.resp_logprobs,
-               advantages=[0.0] * len(prompt_tokens) + [advantage] * response_len,
-               reward=reward,
-               eos_token_id=trainer.get_tokenizer().eos_token_id,
-           )
-       )
-
-   stats = trainer.train(batch, partial(gspo_loss_fn, clip_eps=3.0e-4), mini_bs=4)
-   print(stats)
-   trainer.close()
+   # In a full loop, load a PromptBatch with trainer.load_prompt_batches(...).
+   # Then call: agent_train_batch = asyncio.run(collect_agentic_batch(trainer, prompt_batch))

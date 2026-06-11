@@ -160,12 +160,30 @@ Runtime memory and speed
    Enable decoder-layer activation recompute during training. Default:
    enabled.
 
-``--keep-rollout-state``
-   Keep rollout state on GPU between steps for speed. This trades extra GPU
-   memory for lower rollout setup overhead.
+``--drop-rollout-state``
+   Drop rollout state after each step to save GPU memory. By default, Areno
+   keeps rollout state on GPU between steps for lower rollout setup overhead.
 
 ``--eager-decode``
    Disable decode CUDA graph and run rollout decode eagerly.
+
+Agentic rollout
+~~~~~~~~~~~~~~~
+
+``--agent-fn TEXT``
+   Python file defining ``async def run_agent(ctx, batch)``. When provided,
+   online RL algorithms use agentic rollout mode instead of direct prompt
+   completion. The agent receives a local OpenAI-compatible base URL from
+   ``ctx.get_base_url()`` and can call ``/v1/chat/completions`` with tools.
+
+``--agent-timeout-s FLOAT``
+   Timeout for agentic proxy requests and trajectory collection. Default:
+   ``300.0``.
+
+``--train-tool-results``
+   Include tool-result spans in policy loss. Disabled by default because tool
+   results are environment observations rather than policy actions. Assistant
+   text and assistant tool-call spans are trainable by default.
 
 Checkpointing and metrics
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -303,6 +321,34 @@ PPO with reward and critic roles
      --algo ppo \
      --tp-size 4 \
      --world-size 8
+
+Agentic Tic-Tac-Toe
+~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+   python examples/agentic/tictactoe/dataset_generator.py \
+     --output /tmp/areno-tictactoe.jsonl \
+     --count 256 \
+     --seed 2026
+
+   areno train \
+     --ckpt Qwen/Qwen3-0.6B \
+     --dataset-path /tmp/areno-tictactoe.jsonl \
+     --dataset-loader-fn examples/agentic/tictactoe/dataset_loader.py \
+     --reward-fn-path examples/agentic/tictactoe/reward.py \
+     --agent-fn examples/agentic/tictactoe/run_agent.py \
+     --algo gspo \
+     --tp-size 1 \
+     --world-size 1 \
+     --batch-size 32 \
+     --n-samples 8 \
+     --max-new-tokens 32
+
+The agent function can use the OpenAI Python client against
+``ctx.get_base_url()``. Areno records tokens, rollout logprobs, parsed
+``tool_calls``, rewards, and loss masks, then feeds the resulting batch to the
+same policy trainer used by non-agentic rollouts.
 
 Help
 ----

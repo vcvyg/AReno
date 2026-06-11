@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import asyncio
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +38,7 @@ class PolicyOnlyTrainer:
         self.reward_fn = reward_fn
         self.loss_fn = loss_fn
         self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
+        self._agent_run_fn = None
 
     def fit(self) -> None:
         self.areno.init()
@@ -68,16 +70,21 @@ class PolicyOnlyTrainer:
             ):
                 role = self._policy_role_name()
                 self.logger.info("epoch=%d step=%d role=%s stage=rollout_start", epoch, step, role)
-                # 1) Sample n_samples completions per prompt; ordering matches
-                #    `prompt_batch.items` so we can zip them downstream.
-                prompt_tokens = [item.input_tokens for item in prompt_batch.items]
-                rollout_results = self.areno.rollout_token_batch(prompt_tokens, self.config.n_samples, sampling_params)
-                self.logger.info("epoch=%d step=%d role=%s stage=rollout_end", epoch, step, role)
-                self._log_sample_completions(tokenizer, epoch, step, prompt_batch, rollout_results)
+                if self._agentic_enabled():
+                    agent_batch = asyncio.run(self._run_agentic_rollout(sampling_params, prompt_batch))
+                    self.logger.info("epoch=%d step=%d role=%s stage=rollout_end", epoch, step, role)
+                    self._log_agentic_sample_completions(epoch, step, agent_batch)
+                    train_batch, rewards_all, rollout_logprobs = self._materialize_agentic_train_batch(tokenizer, prompt_batch, agent_batch)
+                else:
+                    # 1) Sample n_samples completions per prompt; ordering
+                    #    matches `prompt_batch.items` so we can zip downstream.
+                    rollout_results = asyncio.run(self._run_prompt_rollout(sampling_params, prompt_batch))
+                    self.logger.info("epoch=%d step=%d role=%s stage=rollout_end", epoch, step, role)
+                    self._log_sample_completions(tokenizer, epoch, step, prompt_batch, rollout_results)
 
-                # 2+3) Score rewards and broadcast group-normalised advantages
-                #      down to per-token tensors via `_materialize_train_batch`.
-                train_batch, rewards_all, rollout_logprobs = self._materialize_train_batch(tokenizer, prompt_batch, rollout_results)
+                    # 2+3) Score rewards and broadcast group-normalised
+                    #      advantages down to per-token tensors.
+                    train_batch, rewards_all, rollout_logprobs = self._materialize_train_batch(tokenizer, prompt_batch, rollout_results)
 
                 if rewards_all:
                     self.logger.info("epoch=%d step=%d metric=reward_mean value=%.6f", epoch, step, float(np.mean(rewards_all)))
@@ -133,6 +140,104 @@ class PolicyOnlyTrainer:
         # reference forward-time, ...) before they reach the metric recorder.
         return result
 
+    def _agentic_enabled(self) -> bool:
+        return bool(getattr(self.config, "agent_fn", None))
+
+    def _loss_mask_policy(self):
+        from areno.api.agentic import LossMaskPolicy
+
+        return LossMaskPolicy(
+            tool_results=bool(getattr(self.config, "train_tool_results", False)),
+        )
+
+    def _get_agent_run_fn(self):
+        from areno.api.agentic import load_agent_run_fn
+
+        if self._agent_run_fn is None:
+            self._agent_run_fn = load_agent_run_fn(self.config.agent_fn)
+        return self._agent_run_fn
+
+    async def _run_prompt_rollout(self, sampling_params, prompt_batch):
+        async with self.areno.rollout_session(
+            sampling_params=sampling_params,
+            max_running_prompts=self.config.resolved_max_running_prompts(),
+            proxy=False,
+        ):
+            prompt_tokens = [item.input_tokens for item in prompt_batch.items]
+            return self.areno.rollout_token_batch(prompt_tokens, self.config.n_samples, sampling_params)
+
+    async def _run_agentic_rollout(self, sampling_params, prompt_batch):
+        from areno.api.agentic import AgentBatch, maybe_await
+
+        agent_batch = AgentBatch.from_prompt_batch(prompt_batch, n_samples=self.config.n_samples)
+        self.logger.info(
+            "agentic rollout batch prompts=%d n_samples=%d expected_requests=%d max_running_prompts=%d",
+            len(agent_batch.records),
+            agent_batch.n_samples,
+            len(agent_batch),
+            self.config.resolved_max_running_prompts(),
+        )
+        async with self.areno.rollout_session(
+            sampling_params=sampling_params,
+            loss_mask_policy=self._loss_mask_policy(),
+            max_running_prompts=self.config.resolved_max_running_prompts(),
+            timeout_s=self.config.agent_timeout_s,
+        ) as ctx:
+            ctx.attach_batch(agent_batch)
+            await maybe_await(self._get_agent_run_fn()(ctx, agent_batch))
+            ctx.finish_requests()
+            return await ctx.get_train_batch(reward_fn=self.reward_fn)
+
+    def _materialize_agentic_train_batch(self, tokenizer, prompt_batch, agent_batch):
+        """Assemble TrainSequence rows from an agentic rollout batch."""
+
+        import areno.api
+        from areno.api.rewards import compute_group_advantages
+
+        del prompt_batch
+        if agent_batch.rewards is None:
+            raise ValueError("agentic policy training requires a reward_fn")
+        train_batch = []
+        rewards_all = [float(reward) for reward in agent_batch.rewards]
+        rollout_logprobs = []
+        grouped: dict[int, list[int]] = {}
+        for row_idx, record in enumerate(agent_batch.reward_records):
+            prompt_index = int(record.metadata.get("prompt_index", row_idx))
+            grouped.setdefault(prompt_index, []).append(row_idx)
+        advantages_by_row: dict[int, float] = {}
+        for row_indices in grouped.values():
+            group_rewards = [rewards_all[row_idx] for row_idx in row_indices]
+            for row_idx, advantage in zip(row_indices, compute_group_advantages(group_rewards), strict=True):
+                advantages_by_row[row_idx] = float(advantage)
+        for row_idx, (tokens, response_mask, loss_mask, logprobs, reward) in enumerate(
+            zip(
+                agent_batch.token_rows,
+                agent_batch.response_masks,
+                agent_batch.loss_masks,
+                agent_batch.rollout_logprobs,
+                rewards_all,
+                strict=True,
+            )
+        ):
+            if len(tokens) != len(response_mask) or len(tokens) != len(loss_mask) or len(tokens) != len(logprobs):
+                raise ValueError("agentic train batch has misaligned token/mask/logprob rows")
+            prompt_mask = [not item for item in response_mask]
+            advantage = advantages_by_row.get(row_idx, 0.0)
+            advantages = [advantage if is_loss else 0.0 for is_loss in loss_mask]
+            rollout_logprobs.extend(lp for lp, is_loss in zip(logprobs, loss_mask, strict=True) if is_loss)
+            train_batch.append(
+                areno.api.TrainSequence(
+                    prompt_mask=prompt_mask,
+                    loss_mask=loss_mask,
+                    tokens=tokens,
+                    logprobs=logprobs,
+                    advantages=advantages,
+                    reward=float(reward),
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            )
+        return train_batch, rewards_all, rollout_logprobs
+
     def _log_sample_completions(self, tokenizer, epoch: int, step: int, prompt_batch, rollout_results) -> None:
         # Diagnostics knob: setting ARENO_LOG_COMPLETIONS=N dumps up to N
         # decoded completions per step so reward debugging is easier.
@@ -155,6 +260,30 @@ class PolicyOnlyTrainer:
                 logged += 1
                 if logged >= limit:
                     return
+
+    def _log_agentic_sample_completions(self, epoch: int, step: int, agent_batch) -> None:
+        # Match non-agentic rollout diagnostics so reward/debug workflows do
+        # not depend on rollout mode.
+        limit = int(os.getenv("ARENO_LOG_COMPLETIONS", "0"))
+        if limit <= 0:
+            return
+        for logged, record in enumerate(agent_batch.reward_records):
+            prompt_idx = int(record.metadata.get("prompt_index", -1))
+            sample_idx = int(record.metadata.get("sample_index", -1))
+            self.logger.info(
+                "epoch=%d step=%d prompt_idx=%d sample_idx=%d prompt=%r completion=%r tool_calls=%s loss_mask=%s tokens=%s",
+                epoch,
+                step,
+                prompt_idx,
+                sample_idx,
+                record.prompt,
+                record.completion,
+                record.tool_calls,
+                record.loss_mask[:64],
+                record.tokens[:64],
+            )
+            if logged + 1 >= limit:
+                return
 
     def _materialize_train_batch(self, tokenizer, prompt_batch, rollout_results):
         """Assemble TrainSequence rows for one rollout batch.

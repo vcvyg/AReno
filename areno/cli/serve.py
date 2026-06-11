@@ -1,22 +1,16 @@
 """OpenAI-compatible FastAPI server fronting the areno engine.
 
-Exposes a `/v1/chat/completions` endpoint backed by a continuous-batching
-scheduler that merges compatible requests (same BatchKey) into a single
-rollout session. New prompts arriving mid-rollout take a fast-attach
-path into the active session when its KV cache can absorb them;
-otherwise a new session is started under the engine lock. Per-prompt
-cancellation is signalled through a shared-memory uint8 flag tensor
-that the worker observes, so HTTP disconnects abort generation
-without tearing down the whole batch.
+Exposes a `/v1/chat/completions` endpoint backed by concurrent rollout calls.
+Per-prompt cancellation is signalled through a shared-memory uint8 flag tensor
+that the worker observes, so HTTP disconnects abort generation without tearing
+down unrelated requests.
 """
 
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -109,10 +103,9 @@ class BatchKey:
 class PendingRequest:
     """Per-request bookkeeping carried from HTTP handler through the scheduler.
 
-    `future` is the asyncio handoff used by the worker thread to deliver the
-    response back to the request coroutine. `prompt_start`/`prompt_end` mark
-    this request's contiguous slice in the session-wide `cancel_flags` tensor
-    (assigned once the request is admitted into a continuous session).
+    `future` is the asyncio handoff used to deliver the response back to the
+    request coroutine. `prompt_start`/`prompt_end` mark this request's
+    contiguous slice in the shared `cancel_flags` tensor.
     """
 
     request: ChatCompletionRequest
@@ -127,95 +120,10 @@ class PendingRequest:
 
 
 @dataclass(slots=True)
-class ContinuousRolloutSession:
-    """State of one merged rollout session shared across many requests.
-
-    A session owns a single engine.generate_rollout call. New compatible
-    batches can fast-attach as long as `can_accept` is satisfied; partial
-    callbacks fan results back out to per-request futures using
-    `prompt_to_choice` to map engine prompt indices back to (request, choice).
-    """
-
-    id: int
-    key: BatchKey
-    loop: asyncio.AbstractEventLoop
-    tokenizer: Any
-    model_path: str
-    max_cache_len: int = 0
-    prompt_count: int = 0
-    entries: list[tuple[PendingRequest, int, int]] = field(default_factory=list)
-    prompt_to_choice: dict[int, tuple[PendingRequest, int]] = field(default_factory=dict)
-    partial_responses: dict[int, list[list[int] | None]] = field(default_factory=dict)
-    partial_reasons: dict[int, list[str | None]] = field(default_factory=dict)
-    lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def can_accept(self, batch: list[PendingRequest]) -> bool:
-        """True if every prompt in `batch` fits the session's cache headroom."""
-        if self.max_cache_len <= 0:
-            return True
-        return all(len(item.prompt) + self.key.max_new_tokens <= self.max_cache_len for item in batch)
-
-    def add_batch(self, batch: list[PendingRequest]) -> tuple[list[list[int]], int]:
-        """Append `batch` into the session, returning duplicated prompts and the starting offset.
-
-        Each pending request contributes `n` copies of its prompt (one per
-        sampled choice). Tracks per-request slot ranges in `entries` and a
-        reverse map in `prompt_to_choice` so partial callbacks can be routed.
-        """
-        prompts: list[list[int]] = []
-        with self.lock:
-            offset = self.prompt_count
-            for item in batch:
-                start = self.prompt_count
-                prompts.extend([item.prompt for _ in range(item.request.n)])
-                self.prompt_count += int(item.request.n)
-                end = self.prompt_count
-                self.entries.append((item, start, end))
-                self.partial_responses[id(item)] = [None for _ in range(item.request.n)]
-                self.partial_reasons[id(item)] = [None for _ in range(item.request.n)]
-                for choice_index, prompt_index in enumerate(range(start, end)):
-                    self.prompt_to_choice[prompt_index] = (item, choice_index)
-            return prompts, offset
-
-    def on_partial(self, prompt_index: int, response_ids: list[int], finish_reason: str) -> None:
-        """Worker callback delivering a finished prompt slot's tokens back to its request.
-
-        Stores the slot's tokens and finish reason; once every choice for the
-        owning request is filled, builds the full response and resolves the
-        request future on its originating event loop.
-        """
-        with self.lock:
-            slot = self.prompt_to_choice.get(prompt_index)
-            if slot is None:
-                return
-            item, choice_index = slot
-            responses = self.partial_responses[id(item)]
-            reasons = self.partial_reasons[id(item)]
-            if item.future.done() or responses[choice_index] is not None:
-                return
-            responses[choice_index] = response_ids
-            reasons[choice_index] = finish_reason
-            if not all(row is not None for row in responses):
-                return
-            response = _build_response_from(
-                self.tokenizer,
-                self.model_path,
-                item.request,
-                item.prompt,
-                [row for row in responses if row is not None],
-                [reason or "stop" for reason in reasons],
-            )
-            # Hop back onto the request's event loop to resolve the future safely.
-            self.loop.call_soon_threadsafe(_set_future_result, item.future, response)
-
-
-@dataclass(slots=True)
 class ServeState:
     """Process-wide serving state held on `app.state.areno_serve`.
 
-    Holds the loaded engine and tokenizer, scheduler tunables, and the
-    queue/condition/lock primitives that gate the batcher loop, the engine
-    call and the currently active continuous session.
+    Holds the loaded engine/tokenizer and tracks in-flight request tasks.
     """
 
     model_path: str
@@ -223,15 +131,7 @@ class ServeState:
     engine: ArenoEngine
     max_running_prompts: int
     default_max_tokens: int
-    batch_wait_s: float
-    max_batch_prompts: int
-    queue: deque[PendingRequest] = field(default_factory=deque)
-    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
-    engine_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    active_batch_tasks: set[asyncio.Task] = field(default_factory=set)
-    active_session: ContinuousRolloutSession | None = None
-    next_session_id: int = 1
-    batcher_task: asyncio.Task | None = None
+    active_tasks: set[asyncio.Task] = field(default_factory=set)
     closing: bool = False
 
 
@@ -243,8 +143,6 @@ def create_app(
     max_running_prompts: int,
     default_max_tokens: int,
     decode_progress_interval_s: float,
-    batch_wait_ms: float,
-    max_batch_prompts: int,
 ) -> FastAPI:
     """Construct the FastAPI app: load tokenizer/engine, install routes and lifecycle hooks."""
     if world_size < 1:
@@ -268,28 +166,17 @@ def create_app(
         engine=engine,
         max_running_prompts=max_running_prompts,
         default_max_tokens=default_max_tokens,
-        batch_wait_s=max(0.0, float(batch_wait_ms)) / 1000.0,
-        max_batch_prompts=max(1, int(max_batch_prompts)),
     )
     app = FastAPI(title="areno OpenAI-compatible server")
     app.state.areno_serve = state
     app.state.decode_progress_interval_s = float(decode_progress_interval_s)
 
-    @app.on_event("startup")
-    async def startup() -> None:
-        """Spawn the long-running batcher coroutine when the app starts."""
-        state.batcher_task = asyncio.create_task(_batcher_loop(app))
-
     @app.on_event("shutdown")
     async def shutdown() -> None:
-        """Signal closing, drain in-flight batch tasks, then tear the engine down."""
-        async with state.condition:
-            state.closing = True
-            state.condition.notify_all()
-        if state.batcher_task is not None:
-            await state.batcher_task
-        if state.active_batch_tasks:
-            await asyncio.gather(*state.active_batch_tasks, return_exceptions=True)
+        """Signal closing, drain in-flight request tasks, then tear the engine down."""
+        state.closing = True
+        if state.active_tasks:
+            await asyncio.gather(*state.active_tasks, return_exceptions=True)
         state.engine.close()
 
     @app.get("/health")
@@ -314,13 +201,7 @@ def create_app(
 
     @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
     async def chat_completions(raw_request: Request, request: ChatCompletionRequest) -> ChatCompletionResponse:
-        """Validate the request, encode the prompt, enqueue it for the batcher, and await the response.
-
-        Streaming is unsupported. The prompt's `BatchKey` is computed up front
-        so that the scheduler can match it against compatible peers without
-        re-decoding the request. A watcher task is started by
-        `_await_pending_response` to observe client disconnects.
-        """
+        """Validate the request, encode the prompt, run rollout, and await the response."""
         if request.stream:
             raise HTTPException(status_code=400, detail="stream=true is not supported")
         if not request.messages:
@@ -342,170 +223,46 @@ def create_app(
             key=key,
             future=asyncio.get_running_loop().create_future(),
         )
-        async with state.condition:
-            if state.closing:
-                raise HTTPException(status_code=503, detail="server is shutting down")
-            state.queue.append(pending)
-            # Wake the batcher loop so it can consider this request immediately.
-            state.condition.notify()
+        if state.closing:
+            raise HTTPException(status_code=503, detail="server is shutting down")
+        task = asyncio.create_task(_run_request_task(app, pending))
+        state.active_tasks.add(task)
+        task.add_done_callback(state.active_tasks.discard)
         return await _await_pending_response(state, raw_request, pending)
 
     return app
 
 
-async def _batcher_loop(app: FastAPI) -> None:
-    """Main scheduler loop: wait for queued requests, coalesce, then dispatch a batch task.
+async def _run_request_task(app: FastAPI, item: PendingRequest) -> None:
+    """Run one HTTP request as an independent concurrent rollout call."""
 
-    Once the queue is non-empty it waits up to `batch_wait_s` past the head
-    request's arrival for additional same-key requests to pile up (improves
-    GPU utilisation), then pops a compatible batch and hands it off to
-    `_run_batch_task`.
-    """
-    state: ServeState = app.state.areno_serve
-    while True:
-        async with state.condition:
-            while not state.queue and not state.closing:
-                await state.condition.wait()
-            if state.closing and not state.queue:
-                return
-            first = state.queue[0]
-            # Allow same-key requests to coalesce for at most `batch_wait_s`.
-            deadline = first.created_at + state.batch_wait_s
-            while not state.closing and _queued_prompt_count(state.queue) < state.max_batch_prompts:
-                delay = deadline - time.monotonic()
-                if delay <= 0:
-                    break
-                try:
-                    # Wait either for a new request or until the coalescing deadline.
-                    await asyncio.wait_for(state.condition.wait(), timeout=delay)
-                except asyncio.TimeoutError:
-                    break
-            batch = _pop_compatible_batch(state)
-        if batch:
-            task = asyncio.create_task(_run_batch_task(app, batch))
-            state.active_batch_tasks.add(task)
-            task.add_done_callback(state.active_batch_tasks.discard)
-
-
-async def _run_batch_task(app: FastAPI, batch: list[PendingRequest]) -> None:
-    """Dispatch one popped batch: fast-attach to the active session or start a new one.
-
-    Fast-attach path (cheap, holds only the condition): if a session is live
-    with a matching BatchKey and enough cache headroom, hand the prompts to
-    the engine via `add_rollout_batch` and return without acquiring the
-    engine lock. Slow path: acquire `engine_lock` (serialising engine
-    sessions) and spin up a fresh `ContinuousRolloutSession` for this batch.
-    """
-    state: ServeState = app.state.areno_serve
     try:
-        async with state.condition:
-            session = state.active_session
-            if session is not None and session.key == batch[0].key and session.can_accept(batch):
-                # Fast-attach: feed prompts into the running rollout without a new engine call.
-                prompts, offset = session.add_batch(batch)
-                state.engine.add_rollout_batch(prompts, session_id=session.id, prompt_offset=offset)
-                return
-        # No compatible active session: serialise on engine_lock to launch a new one.
-        async with state.engine_lock:
-            async with state.condition:
-                session_id = state.next_session_id
-                state.next_session_id += 1
-                session = ContinuousRolloutSession(
-                    id=session_id,
-                    key=batch[0].key,
-                    loop=asyncio.get_running_loop(),
-                    tokenizer=state.tokenizer,
-                    model_path=state.model_path,
-                    max_cache_len=max(len(item.prompt) + batch[0].key.max_new_tokens for item in batch),
-                )
-                state.active_session = session
-            try:
-                # The engine call is blocking C++/CUDA, so run it on a worker thread.
-                await asyncio.to_thread(_run_continuous_session, app, session, batch)
-            finally:
-                async with state.condition:
-                    if state.active_session is session:
-                        state.active_session = None
+        response = await _run_request_rollout(app, item)
+        _set_future_result(item.future, response)
     except BaseException as exc:
-        for item in batch:
-            if not item.future.done():
-                item.future.set_exception(exc)
+        if not item.future.done():
+            item.future.set_exception(exc)
 
 
-def _pop_compatible_batch(state: ServeState) -> list[PendingRequest]:
-    """Pop the head request plus any same-key followers, dropping cancelled entries.
+async def _run_request_rollout(app: FastAPI, item: PendingRequest) -> ChatCompletionResponse | None:
+    """Run one request through the async engine rollout path."""
 
-    Walks `state.queue` once, keeping the head request and any subsequent
-    requests that share its `BatchKey` and fit the prompt budget. Items that
-    were cancelled or already completed are silently dropped. Non-matching
-    items are preserved in queue order via `kept`.
-    """
-    first = state.queue.popleft()
-    while (first.cancelled or first.future.done()) and state.queue:
-        # Skip cancelled/done requests at the head so the batch starts on a live one.
-        first = state.queue.popleft()
-    if first.cancelled or first.future.done():
-        return []
-    batch = [first]
-    batch_prompts = int(first.request.n)
-    prompt_budget = max(1, min(state.max_running_prompts, state.max_batch_prompts))
-    kept: deque[PendingRequest] = deque()
-    while state.queue and batch_prompts < prompt_budget:
-        item = state.queue.popleft()
-        if item.cancelled or item.future.done():
-            continue
-        item_prompts = int(item.request.n)
-        if item.key == first.key and batch_prompts + item_prompts <= prompt_budget:
-            batch.append(item)
-            batch_prompts += item_prompts
-        else:
-            kept.append(item)
-    # Re-attach the unmatched tail so it can be considered on the next loop iteration.
-    kept.extend(state.queue)
-    state.queue = kept
-    return batch
-
-
-def _queued_prompt_count(queue: deque[PendingRequest]) -> int:
-    """Total number of distinct prompts (counting `n` per request) currently queued."""
-    return sum(int(item.request.n) for item in queue)
-
-
-def _run_continuous_session(app: FastAPI, session: ContinuousRolloutSession, batch: list[PendingRequest]) -> None:
-    """Run a fresh rollout session for `batch` on the engine; called via asyncio.to_thread.
-
-    Allocates the per-session `cancel_flags` shared-memory uint8 tensor (one
-    byte per prompt slot, observable across threads and the worker process),
-    assigns each request a contiguous slot range, and invokes
-    `engine.generate_rollout`. Any request that was already cancelled before
-    the call has its slots pre-flagged so the worker skips them.
-
-    On return, fan the final response_ids/finish_reasons back to each
-    request future. Most responses are usually already resolved via
-    `session.on_partial`; the loop here covers the synchronous tail.
-    """
     state: ServeState = app.state.areno_serve
-    key = batch[0].key
-    prompts, _offset = session.add_batch(batch)
-    # uint8 + share_memory_ so the worker thread/process can observe cancellation toggles.
-    cancel_flags = torch.zeros(sum(int(item.request.n) for item in batch), dtype=torch.uint8).share_memory_()
-    start = 0
-    for item in batch:
-        # Each request gets a contiguous [prompt_start, prompt_end) slot range.
-        item.prompt_start = start
-        item.prompt_end = start + int(item.request.n)
-        item.cancel_flags = cancel_flags
-        if item.cancelled or item.future.cancelled():
-            # Pre-flag already-cancelled requests so the engine never runs their slots.
-            cancel_flags[item.prompt_start : item.prompt_end] = 1
-        start = item.prompt_end
-    if all(item.cancelled or item.future.done() for item in batch):
-        return
+    key = item.key
+    prompts = [item.prompt for _ in range(int(item.request.n))]
+    cancel_flags = torch.zeros(len(prompts), dtype=torch.uint8).share_memory_()
+    item.prompt_start = 0
+    item.prompt_end = len(prompts)
+    item.cancel_flags = cancel_flags
+    if item.cancelled or item.future.cancelled():
+        cancel_flags[:] = 1
+    if item.cancelled or item.future.done():
+        return None
 
-    rollout = state.engine.generate_rollout(
+    rollout = await state.engine.generate_rollout_async(
         prompts,
         max_new_tokens=key.max_new_tokens,
-        max_running_prompts=min(state.max_running_prompts, max(len(prompts), 1)),
+        max_running_prompts=max(state.max_running_prompts, len(prompts)),
         eos_token_id=key.eos_token_id,
         sampling_params=SamplingParams(
             temperature=key.temperature,
@@ -515,24 +272,16 @@ def _run_continuous_session(app: FastAPI, session: ContinuousRolloutSession, bat
             stop_token_ids=key.stop_token_ids,
         ),
         decode_progress_interval_s=app.state.decode_progress_interval_s,
-        partial_callback=session.on_partial,
         cancel_flags=cancel_flags,
-        session_id=session.id,
     )
-    # Snapshot under the lock; mid-rollout fast-attach may have appended entries.
-    with session.lock:
-        entries = list(session.entries)
-    for item, start, end in entries:
-        if item.future.done() or end > len(rollout.response_ids):
-            continue
-        response = _build_response(state, item.request, item.prompt, rollout.response_ids[start:end], rollout.finish_reason[start:end])
-        # Resolve from the worker thread by hopping back to the request's loop.
-        item.future.get_loop().call_soon_threadsafe(_set_future_result, item.future, response)
+    if item.future.done():
+        return None
+    return _build_response(state, item.request, item.prompt, rollout.response_ids, rollout.finish_reason)
 
 
 def _set_future_result(future: asyncio.Future, response: ChatCompletionResponse) -> None:
     """Resolve `future` with `response` unless something else got there first."""
-    if not future.done():
+    if response is not None and not future.done():
         future.set_result(response)
 
 
@@ -716,8 +465,6 @@ def _trim_stop_strings(text: str, stop: list[str]) -> tuple[str, bool]:
 @click.option("--host", default="0.0.0.0", show_default=True, help="HTTP bind host.")
 @click.option("--port", type=int, default=8000, show_default=True, help="HTTP bind port.")
 @click.option("--max-running-prompts", type=int, default=128, show_default=True, help="Maximum concurrent rollout prompts per request chunk.")
-@click.option("--max-batch-prompts", type=int, default=128, show_default=True, help="Maximum prompts to merge into one generate call.")
-@click.option("--batch-wait-ms", type=float, default=10.0, show_default=True, help="Milliseconds to wait for compatible requests before starting a new decode session.")
 @click.option("--default-max-tokens", type=int, default=1024, show_default=True, help="Default max generated tokens.")
 @click.option("--decode-progress-interval-s", type=float, default=0.0, show_default=True, help="Worker decode progress log interval.")
 def serve_command(
@@ -727,8 +474,6 @@ def serve_command(
     host: str,
     port: int,
     max_running_prompts: int,
-    max_batch_prompts: int,
-    batch_wait_ms: float,
     default_max_tokens: int,
     decode_progress_interval_s: float,
 ) -> None:
@@ -743,8 +488,6 @@ def serve_command(
         max_running_prompts=max_running_prompts,
         default_max_tokens=default_max_tokens,
         decode_progress_interval_s=decode_progress_interval_s,
-        batch_wait_ms=batch_wait_ms,
-        max_batch_prompts=max_batch_prompts,
     )
     uvicorn.run(app, host=host, port=port)
 

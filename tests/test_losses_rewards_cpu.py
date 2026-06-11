@@ -62,6 +62,25 @@ class LossFunctionTest(unittest.TestCase):
         self.assertIsNotNone(logprobs.grad)
         self.assertIn("policy_loss", stats)
 
+    def test_grpo_padded_loss_mask_blocks_masked_response_gradients(self):
+        """Explicit loss masks should remove selected response tokens from loss."""
+        data_pack = {
+            "prompt_mask": torch.tensor([[True, True, False, False]]),
+            "loss_mask": torch.tensor([[False, False, True, False]]),
+            "advantages": torch.tensor([[0.0, 0.0, 1.0, 100.0]]),
+            "logprobs": torch.tensor([[0.0, 0.0, -0.3, -0.4]]),
+        }
+        logprobs = torch.tensor([[0.0, -0.3, -0.4]], requires_grad=True)
+
+        loss, stats = grpo_loss_fn(data_pack, logprobs)
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(float(stats["response_len"]), 1.0)
+        self.assertEqual(float(logprobs.grad[0, 0]), 0.0)
+        self.assertNotEqual(float(logprobs.grad[0, 1]), 0.0)
+        self.assertEqual(float(logprobs.grad[0, 2]), 0.0)
+
     def test_grpo_packed_loss_groups_tokens_by_sequence(self):
         """Packed GRPO should aggregate response tokens by sequence id."""
         data_pack = {

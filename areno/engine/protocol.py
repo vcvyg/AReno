@@ -5,20 +5,22 @@ exposes `ArenoEngine`) and one worker process per device. A `TPCluster` owns
 the worker subprocesses, broadcasts a single `Command` to all of them, and
 waits for every rank to report a `WorkerResult` before returning. Workers run
 the per-rank event loop in `_worker_entry`, which knows how to defer
-`INFER_ROLLOUT_ADD` commands so that they always arrive after the matching
-`INFER_ROLLOUT` setup command.
+request-id demux so multiple caller threads/tasks can have in-flight commands.
 """
 
 from __future__ import annotations
 
 import multiprocessing as mp
+import asyncio
 import queue
 import socket
+import threading
 import time
 import traceback
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Callable
+from itertools import count
+from typing import Any
 
 import torch
 
@@ -32,12 +34,13 @@ class Op(Enum):
 
     TRAIN = auto()
     INFER_ROLLOUT = auto()
-    INFER_ROLLOUT_ADD = auto()
     ENSURE_ROLES = auto()
     SCORE_LOGPROBS = auto()
     SCORE_VALUES = auto()
     SCORE_REWARDS = auto()
     TRAIN_VALUES = auto()
+    ROLLOUT_SESSION_BEGIN = auto()
+    ROLLOUT_SESSION_END = auto()
     SAVE_CHECKPOINT = auto()
     SHUTDOWN = auto()
 
@@ -48,21 +51,20 @@ class Command:
 
     op: Op
     payload: Any = None
+    request_id: int | None = None
 
 
 @dataclass(slots=True)
 class WorkerResult:
     """Rank response payload or serialized traceback.
 
-    `final=False` indicates a partial result delivered mid-op (for example,
-    streaming token batches from a rollout); `final=True` closes the op and
-    counts toward the per-rank completion in `TPCluster.call`.
+    `request_id` lets the coordinator demux multiple concurrent calls.
     """
 
     ok: bool
     payload: Any = None
     error: str | None = None
-    final: bool = True
+    request_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -71,7 +73,6 @@ class RolloutPayload:
 
     prompts_by_dp: list[list[list[int]]]
     prompt_indices_by_dp: list[list[int]]
-    session_id: int | None
     max_new_tokens: int
     eos_token_id: int | tuple[int, ...] | None
     sampling_params: SamplingParams
@@ -82,17 +83,6 @@ class RolloutPayload:
     num_blocks: int
     block_size: int
     decode_progress_interval_s: float = 0.0
-    cancel_flags: torch.Tensor | None = None
-    cancel_indices_by_dp: list[list[int]] | None = None
-
-
-@dataclass(slots=True)
-class RolloutAddPayload:
-    """Typed payload for Op.INFER_ROLLOUT_ADD."""
-
-    session_id: int
-    prompts_by_dp: list[list[list[int]]]
-    prompt_indices_by_dp: list[list[int]]
     cancel_flags: torch.Tensor | None = None
     cancel_indices_by_dp: list[list[int]] | None = None
 
@@ -150,14 +140,16 @@ class SaveCheckpointPayload:
 
 
 @dataclass(slots=True)
-class RolloutPartialPayload:
-    """Typed worker-to-coordinator partial rollout event."""
+class _PendingClusterCall:
+    """Coordinator-side accumulator for one in-flight cluster request."""
 
-    dp_rank: int
-    rows: list[int]
-    response_ids: list[list[int]]
-    finish_reason: list[str]
-    prompt_indices: list[int] | None = None
+    op: Op
+    results: list[Any]
+    pending: set[int]
+    event: threading.Event
+    future: asyncio.Future | None = None
+    loop: asyncio.AbstractEventLoop | None = None
+    error: BaseException | None = None
 
 
 def find_free_port() -> int:
@@ -188,6 +180,12 @@ class TPCluster:
         self.result_queue: mp.Queue = self.ctx.Queue()
         self.processes: list[mp.Process] = []
         self.started = False
+        self._send_lock = threading.Lock()
+        self._request_ids = count(1)
+        self._pending_lock = threading.Lock()
+        self._pending_calls: dict[int, _PendingClusterCall] = {}
+        self._pump_stop = threading.Event()
+        self._pump_thread: threading.Thread | None = None
 
     def start(self) -> None:
         """Spawn workers and wait until every rank has finished initialization."""
@@ -237,6 +235,16 @@ class TPCluster:
             raise
         else:
             self.started = True
+            self._start_result_pump()
+
+    def _start_result_pump(self) -> None:
+        """Start the single result-demux thread for all concurrent calls."""
+
+        if self._pump_thread is not None and self._pump_thread.is_alive():
+            return
+        self._pump_stop.clear()
+        self._pump_thread = threading.Thread(target=self._result_pump_loop, name="areno-tpcluster-results", daemon=True)
+        self._pump_thread.start()
 
     def _wait_for_worker_ready(self, pending: set[int]) -> None:
         """Block until every worker reports that model construction is complete."""
@@ -259,66 +267,122 @@ class TPCluster:
         op: Op,
         payload: Any = None,
         timeout: float | None = None,
-        partial_callback: Callable[[int, Any], None] | None = None,
     ) -> list[Any]:
         """Broadcast one command and collect one ordered result from every rank."""
+        request_id = next(self._request_ids)
+        pending = self._submit_call(op, payload, request_id=request_id)
+        if not pending.event.wait(timeout=timeout):
+            with self._pending_lock:
+                self._pending_calls.pop(request_id, None)
+            raise TimeoutError(f"timed out waiting for {op}")
+        if pending.error is not None:
+            raise pending.error
+        return pending.results
+
+    async def call_async(
+        self,
+        op: Op,
+        payload: Any = None,
+        timeout: float | None = None,
+    ) -> list[Any]:
+        """Async variant of :meth:`call` backed by the shared result pump."""
+
+        request_id = next(self._request_ids)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        self._submit_call(op, payload, request_id=request_id, future=future, loop=loop)
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except BaseException:
+            with self._pending_lock:
+                self._pending_calls.pop(request_id, None)
+            raise
+
+    def _submit_call(
+        self,
+        op: Op,
+        payload: Any = None,
+        *,
+        request_id: int,
+        future: asyncio.Future | None = None,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> _PendingClusterCall:
         if not self.started:
             self.start()
-        # Drain any stale partial results left behind by a previous op so the
-        # current op's final-result count is not inflated.
-        while True:
-            try:
-                self.result_queue.get_nowait()
-            except queue.Empty:
-                break
-        cmd = Command(op=op, payload=payload)
-        for q in self.cmd_queues:
-            q.put(cmd)
-
         world_size = self.config.tp_size * int(self.config.dp_size)
-        # Results are slotted by rank id so the returned list keeps a stable
-        # ordering even though workers complete in arbitrary order.
-        results: list[Any] = [None] * world_size
-        pending = set(range(world_size))
-        received = 0
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while received < world_size:
-            poll_timeout = 0.2
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(f"timed out waiting for {op}")
-                poll_timeout = min(poll_timeout, remaining)
-            try:
-                rank, result = self.result_queue.get(timeout=poll_timeout)
-            except queue.Empty as exc:
-                # No result arrived this tick; detect silently dead workers
-                # so the caller does not hang forever on a crashed process.
-                dead = self._dead_pending_workers(pending)
-                if dead:
-                    details = ", ".join(f"rank {rank} pid {pid} exitcode {exitcode}" for rank, pid, exitcode in dead)
-                    raise RuntimeError(f"worker exited without reporting result during {op}: {details}") from exc
-                continue
-            if not result.ok:
-                raise RuntimeError(f"rank {rank} failed during {op}:\n{result.error}")
-            if not result.final:
-                # Partial (streaming) result: forward to the callback but do
-                # not count it as a completed rank.
-                if partial_callback is not None:
-                    partial_callback(rank, result.payload)
-                continue
-            results[rank] = result.payload
-            pending.discard(rank)
-            received += 1
-        return results
+        pending = _PendingClusterCall(
+            op=op,
+            results=[None] * world_size,
+            pending=set(range(world_size)),
+            event=threading.Event(),
+            future=future,
+            loop=loop,
+        )
+        with self._pending_lock:
+            self._pending_calls[request_id] = pending
+        cmd = Command(op=op, payload=payload, request_id=request_id)
+        with self._send_lock:
+            for q in self.cmd_queues:
+                q.put(cmd)
+        return pending
 
-    def broadcast(self, op: Op, payload: Any = None) -> None:
-        """Broadcast a command without waiting for worker results."""
-        if not self.started:
-            self.start()
-        cmd = Command(op=op, payload=payload)
-        for q in self.cmd_queues:
-            q.put(cmd)
+    def _result_pump_loop(self) -> None:
+        """Read rank results and demux them to the matching pending call."""
+
+        while not self._pump_stop.is_set():
+            try:
+                rank, result = self.result_queue.get(timeout=0.2)
+            except queue.Empty:
+                self._fail_dead_pending_calls()
+                continue
+            request_id = result.request_id
+            if request_id is None:
+                continue
+            with self._pending_lock:
+                pending = self._pending_calls.get(request_id)
+            if pending is None:
+                continue
+            self._apply_result(request_id, rank, result, pending)
+
+    def _apply_result(self, request_id: int, rank: int, result: WorkerResult, pending: _PendingClusterCall) -> None:
+        """Apply one worker result to a pending call and complete it if done."""
+
+        if not result.ok:
+            self._finish_pending_call(request_id, pending, RuntimeError(f"rank {rank} failed during {pending.op}:\n{result.error}"))
+            return
+        pending.results[rank] = result.payload
+        pending.pending.discard(rank)
+        if not pending.pending:
+            self._finish_pending_call(request_id, pending, None)
+
+    def _finish_pending_call(self, request_id: int, pending: _PendingClusterCall, error: BaseException | None) -> None:
+        """Mark a pending call complete and wake sync/async waiters."""
+
+        with self._pending_lock:
+            self._pending_calls.pop(request_id, None)
+        pending.error = error
+        pending.event.set()
+        if pending.future is not None and pending.loop is not None:
+            if error is None:
+                pending.loop.call_soon_threadsafe(_set_async_result, pending.future, pending.results)
+            else:
+                pending.loop.call_soon_threadsafe(_set_async_exception, pending.future, error)
+
+    def _fail_dead_pending_calls(self) -> None:
+        """Fail pending calls when a worker dies without returning a result."""
+
+        with self._pending_lock:
+            calls = list(self._pending_calls.items())
+        for request_id, pending in calls:
+            dead = self._dead_pending_workers(pending.pending)
+            if not dead:
+                continue
+            details = ", ".join(f"rank {rank} pid {pid} exitcode {exitcode}" for rank, pid, exitcode in dead)
+            self._finish_pending_call(
+                request_id,
+                pending,
+                RuntimeError(f"worker exited without reporting result during {pending.op}: {details}"),
+            )
 
     def _dead_pending_workers(self, pending: set[int]) -> list[tuple[int, int | None, int | None]]:
         """Return pending ranks whose process exited before reporting."""
@@ -339,6 +403,13 @@ class TPCluster:
         if not self.started:
             return
         try:
+            pump_stop = getattr(self, "_pump_stop", None)
+            if pump_stop is not None:
+                pump_stop.set()
+            pump_thread = getattr(self, "_pump_thread", None)
+            if pump_thread is not None:
+                pump_thread.join(timeout=2)
+                self._pump_thread = None
             # Polite shutdown: SHUTDOWN op lets workers tear down the
             # distributed context cleanly.
             for q in self.cmd_queues:
@@ -399,13 +470,11 @@ def _worker_entry(
         )
         torch.set_float32_matmul_precision("high")
         worker = worker_cls(config)
-        # Inject coordinator-facing handles so worker methods can send partial
-        # results or pull follow-up commands without re-importing this module.
+        # Inject coordinator-facing handles so worker methods can report
+        # request-id-scoped results without re-importing this module.
         worker._rank = rank
         worker._result_queue = result_q
         worker._cmd_queue = cmd_q
-        # Buffer for INFER_ROLLOUT_ADD commands that arrived before their
-        # matching INFER_ROLLOUT setup op had a chance to run.
         worker._deferred_commands = []
         # Signal readiness only after distributed init, model construction,
         # weight loading, and optimizer setup have completed. Without this
@@ -413,25 +482,20 @@ def _worker_entry(
         # incorrectly includes checkpoint loading.
         result_q.put((rank, WorkerResult(ok=True)))
         while True:
-            # Prefer replaying a deferred ADD over reading a new command, so
-            # batched additions get drained as soon as the worker is free.
             cmd = worker._deferred_commands.pop(0) if worker._deferred_commands else cmd_q.get()
-            # Skip stray ADDs that arrived while we were idle: stash them and
-            # keep pulling until we hit a real op.
-            while cmd.op is Op.INFER_ROLLOUT_ADD:
-                worker._deferred_commands.append(cmd)
-                cmd = cmd_q.get()
             if cmd.op is Op.SHUTDOWN:
                 # Acknowledge shutdown so the coordinator's join completes.
-                result_q.put((rank, WorkerResult(ok=True)))
+                result_q.put((rank, WorkerResult(ok=True, request_id=cmd.request_id)))
                 break
+            worker._current_request_id = cmd.request_id
             payload = worker.handle(cmd)
-            result_q.put((rank, WorkerResult(ok=True, payload=payload)))
+            result_q.put((rank, WorkerResult(ok=True, payload=payload, request_id=cmd.request_id)))
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
         # Send the traceback up to the coordinator so it can raise on call().
-        result_q.put((rank, WorkerResult(ok=False, error=traceback.format_exc())))
+        request_id = getattr(locals().get("cmd", None), "request_id", None)
+        result_q.put((rank, WorkerResult(ok=False, error=traceback.format_exc(), request_id=request_id)))
     finally:
         destroy_process_group()
 
@@ -443,3 +507,17 @@ def _close_queue(q: mp.Queue) -> None:
         q.close()
     finally:
         q.join_thread()
+
+
+def _set_async_result(future: asyncio.Future, value: Any) -> None:
+    """Resolve an asyncio future from the result-pump thread."""
+
+    if not future.done():
+        future.set_result(value)
+
+
+def _set_async_exception(future: asyncio.Future, exc: BaseException) -> None:
+    """Fail an asyncio future from the result-pump thread."""
+
+    if not future.done():
+        future.set_exception(exc)

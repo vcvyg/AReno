@@ -48,9 +48,12 @@ class TrainerConfig:
     grad_clip_norm: float = 1.0
     adam_8bit: bool = False
     activation_checkpointing: bool = True
-    keep_rollout_state: bool = False
+    keep_rollout_state: bool = True
     eager_decode: bool = False
     metrics_log_dir: str | None = DEFAULT_METRICS_LOG_DIR
+    agent_fn: str | None = None
+    agent_timeout_s: float = 300.0
+    train_tool_results: bool = False
 
     def optimizer_config(self) -> dict:
         """Build the optimizer dict consumed by the backend config."""
@@ -98,17 +101,11 @@ class RolloutTrainerConfig(TrainerConfig):
     max_running_prompts: int | None = None
 
     def resolved_max_running_prompts(self) -> int:
-        """Return explicit or per-DP rollout concurrency.
-
-        Online RL expands each prompt into `n_samples` sequences. The engine
-        splits that flat rollout batch across DP ranks, so the natural local
-        concurrency cap is the per-DP sequence count.
-        """
+        """Return explicit or full-batch rollout concurrency."""
 
         if self.max_running_prompts is not None:
             return self.max_running_prompts
-        dp_size = max(self.world_size // self.tp_size, 1)
-        return max((self.batch_size * self.n_samples) // dp_size, 1)
+        return max(self.batch_size * self.n_samples, 1)
 
     def areno_config(self):
         """Build backend config including rollout cache capacity."""
