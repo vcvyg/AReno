@@ -32,7 +32,7 @@ from areno.api.backend.base import Backend, register_backend
 
 
 logger = logging.getLogger(__name__)
-ROLLOUT_COALESCE_WAIT_S = 2.0
+ROLLOUT_COALESCE_WAIT_S = 5.0
 _SYS_PATH_LOCK = Lock()
 _SYS_PATH_PREFERRED = False
 
