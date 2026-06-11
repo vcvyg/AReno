@@ -1,9 +1,8 @@
 """OpenAI-compatible FastAPI server fronting the areno engine.
 
 Exposes a `/v1/chat/completions` endpoint backed by concurrent rollout calls.
-Per-prompt cancellation is signalled through a shared-memory uint8 flag tensor
-that the worker observes, so HTTP disconnects abort generation without tearing
-down unrelated requests.
+HTTP disconnects resolve the client request promptly. The engine rollout keeps
+running so concurrent requests can be coalesced for throughput.
 """
 
 from __future__ import annotations
@@ -23,6 +22,9 @@ from areno.cli.model_refs import resolve_model_ref
 from areno.engine.data import SamplingParams
 from areno.engine.data.tokenizer import load_tokenizer
 from areno.engine import ArenoEngine
+
+
+SERVE_COALESCE_WAIT_S = 0.01
 
 
 def _serve_loss_fn(*_: Any) -> torch.Tensor:
@@ -104,8 +106,7 @@ class PendingRequest:
     """Per-request bookkeeping carried from HTTP handler through the scheduler.
 
     `future` is the asyncio handoff used to deliver the response back to the
-    request coroutine. `prompt_start`/`prompt_end` mark this request's
-    contiguous slice in the shared `cancel_flags` tensor.
+    request coroutine.
     """
 
     request: ChatCompletionRequest
@@ -114,9 +115,6 @@ class PendingRequest:
     future: asyncio.Future
     created_at: float = field(default_factory=time.monotonic)
     cancelled: bool = False
-    prompt_start: int = -1
-    prompt_end: int = -1
-    cancel_flags: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -250,12 +248,6 @@ async def _run_request_rollout(app: FastAPI, item: PendingRequest) -> ChatComple
     state: ServeState = app.state.areno_serve
     key = item.key
     prompts = [item.prompt for _ in range(int(item.request.n))]
-    cancel_flags = torch.zeros(len(prompts), dtype=torch.uint8).share_memory_()
-    item.prompt_start = 0
-    item.prompt_end = len(prompts)
-    item.cancel_flags = cancel_flags
-    if item.cancelled or item.future.cancelled():
-        cancel_flags[:] = 1
     if item.cancelled or item.future.done():
         return None
 
@@ -272,7 +264,7 @@ async def _run_request_rollout(app: FastAPI, item: PendingRequest) -> ChatComple
             stop_token_ids=key.stop_token_ids,
         ),
         decode_progress_interval_s=app.state.decode_progress_interval_s,
-        cancel_flags=cancel_flags,
+        coalesce_timeout_s=SERVE_COALESCE_WAIT_S,
     )
     if item.future.done():
         return None
@@ -305,9 +297,9 @@ async def _await_pending_response(state: ServeState, raw_request: Request, item:
 async def _watch_disconnect(state: ServeState, raw_request: Request, item: PendingRequest) -> None:
     """Poll the underlying HTTP request and flag cancellation if the client drops.
 
-    On disconnect, sets `cancel_flags` for this request's slots so the engine
-    aborts those rollouts at the next decode step, and resolves the future
-    with an empty cancelled response so the caller's await returns promptly.
+    On disconnect, resolves the future with an empty cancelled response so the
+    caller's await returns promptly. The already-submitted engine rollout is
+    allowed to finish so serve requests remain batchable.
     """
     while not item.future.done():
         if await raw_request.is_disconnected():
@@ -319,11 +311,8 @@ async def _watch_disconnect(state: ServeState, raw_request: Request, item: Pendi
 
 
 def _cancel_pending_request(item: PendingRequest) -> None:
-    """Mark the request cancelled and, if admitted into a session, flip its cancel_flags slots."""
+    """Mark the request cancelled."""
     item.cancelled = True
-    if item.cancel_flags is not None and item.prompt_start >= 0:
-        # Write 1 to this request's contiguous slot range; the worker polls this tensor.
-        item.cancel_flags[item.prompt_start : item.prompt_end] = 1
 
 
 def _build_cancelled_response(state: ServeState, item: PendingRequest) -> ChatCompletionResponse:

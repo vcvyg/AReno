@@ -273,6 +273,42 @@ def test_agentic_partial_with_logprobs_completes_http_request():
     assert session._samples[0].response_logprobs == [-0.3, -0.4]
 
 
+def test_agentic_multi_turn_calls_merge_into_one_training_sample():
+    """Multiple model calls for one agent item should form one trajectory sample."""
+
+    trainer = _FakeTrainer(world_size=1, tp_size=1)
+    session = RolloutSession(
+        trainer,
+        sampling_params=_FakeSamplingParams(),
+        loss_mask_policy=LossMaskPolicy(),
+        max_running_prompts=4,
+    )
+    item = agentic.AgentItem(record={"task": "multi"}, prompt="p", input_tokens=[1, 2], prompt_index=0, sample_index=0)
+    first = _pending_chat(0, _FakeSamplingParams())
+    first.item = item
+    first.messages = [{"role": "user", "content": "step 1"}]
+    second = _pending_chat(0, _FakeSamplingParams())
+    second.item = item
+    second.messages = [
+        {"role": "user", "content": "step 1"},
+        {"role": "assistant", "content": "10 11"},
+        {"role": "user", "content": "step 2"},
+    ]
+
+    session._record_chat_sample(first, [10, 11], [-0.1, -0.2])
+    session._record_chat_sample(second, [20], [-0.3])
+    batch = asyncio.run(session.get_train_batch(require_finished=False))
+    record = batch.reward_records[0]
+
+    assert len(session._samples) == 1
+    assert batch.token_rows == [[1, 2, 10, 11, 20]]
+    assert batch.loss_masks == [[False, False, True, True, True]]
+    assert batch.rollout_logprobs == [[0.0, 0.0, -0.1, -0.2, -0.3]]
+    assert record.tokens == [10, 11, 20]
+    assert [event.type for event in record.trace].count("request") == 2
+    assert record.source_record == {"task": "multi"}
+
+
 def test_agentic_tool_request_returns_tool_call_and_reward_record():
     trainer = _FakeTrainer(world_size=1, tp_size=1)
     trainer.tokenizer = _LiteralTokenizer('{"name":"choose_move","arguments":{"direction":"left"}}')

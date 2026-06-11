@@ -418,11 +418,16 @@ class RolloutSession:
     def _response_loss_mask(self, sample: _AgentSample) -> list[bool]:
         if sample.loss_mask_override is not None:
             return list(sample.loss_mask_override)
-        if sample.response_kind == "assistant_tool_call":
+        return self._response_loss_mask_for_span(sample.response_kind, len(sample.response_tokens))
+
+    def _response_loss_mask_for_span(self, response_kind: str, response_len: int) -> list[bool]:
+        """Return loss-mask bits for one assistant response span."""
+
+        if response_kind == "assistant_tool_call":
             enabled = self._loss_mask_policy.assistant_tool_calls
         else:
             enabled = self._loss_mask_policy.assistant_text
-        return [bool(enabled)] * len(sample.response_tokens)
+        return [bool(enabled)] * response_len
 
     def _build_train_rows(self, samples: list[_AgentSample]) -> _AgentTrainRows:
         token_rows: list[list[int]] = []
@@ -583,7 +588,11 @@ class RolloutSession:
         )
         with self._lock:
             if not pending.sample_recorded:
-                self._samples.append(sample)
+                existing = self._find_sample_for_item_locked(pending.item)
+                if existing is None:
+                    self._samples.append(sample)
+                else:
+                    self._append_sample_response(existing, sample)
                 pending.sample_recorded = True
         return pending.response or self._build_pending_chat_response(
             pending,
@@ -591,6 +600,35 @@ class RolloutSession:
             content=content,
             tool_calls=tool_parse.tool_calls,
         )
+
+    def _find_sample_for_item_locked(self, item: AgentItem) -> _AgentSample | None:
+        """Find an existing trajectory for the same prompt/sample pair."""
+
+        key = (item.prompt_index, item.sample_index)
+        for sample in self._samples:
+            if (sample.item.prompt_index, sample.item.sample_index) == key:
+                return sample
+        return None
+
+    def _append_sample_response(self, existing: _AgentSample, new_sample: _AgentSample) -> None:
+        """Append another model response to an existing multi-call trajectory."""
+
+        old_response_kind = existing.response_kind
+        old_response_len = len(existing.response_tokens)
+        if new_sample.response_text:
+            existing.response_text = f"{existing.response_text}\n{new_sample.response_text}" if existing.response_text else new_sample.response_text
+        existing.response_tokens.extend(new_sample.response_tokens)
+        existing.response_logprobs.extend(new_sample.response_logprobs)
+        existing.trace.extend(new_sample.trace)
+        existing.messages = new_sample.messages
+        old_mask = existing.loss_mask_override
+        if old_mask is None:
+            old_mask = self._response_loss_mask_for_span(old_response_kind, old_response_len)
+        new_mask = new_sample.loss_mask_override
+        if new_mask is None:
+            new_mask = self._response_loss_mask_for_span(new_sample.response_kind, len(new_sample.response_tokens))
+        existing.loss_mask_override = list(old_mask) + list(new_mask)
+        existing.response_kind = new_sample.response_kind
 
     def _build_pending_chat_response(
         self,

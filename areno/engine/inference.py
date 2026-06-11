@@ -6,6 +6,7 @@ import logging
 import math
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -31,6 +32,8 @@ from areno.engine.runtime.rollout import _empty_rollout
 
 
 logger = logging.getLogger(__name__)
+
+FinishedRowsCallback = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, tuple[int, ...]], None]
 
 
 def _cancel_stop_token(stop_token_ids: list[int], eos_token_id: int | tuple[int, ...] | None) -> int:
@@ -190,7 +193,7 @@ class InferenceManager:
             self._init_decode_graphs()
 
     @torch.inference_mode()
-    def infer_rollout(self, payload: RolloutPayload) -> RolloutOutput | None:
+    def infer_rollout(self, payload: RolloutPayload, finished_callback: FinishedRowsCallback | None = None) -> RolloutOutput | None:
         """Top-level rollout entry: prepare cache, generate, return on rank 0.
 
         Empty-input shards (e.g. idle DP rank) return an empty RolloutOutput
@@ -236,6 +239,8 @@ class InferenceManager:
                 cancel_flags=payload.cancel_flags,
                 cancel_indices=cancel_indices_by_dp[ctx.dp_rank] if cancel_indices_by_dp is not None else None,
                 prompt_indices=prompt_indices,
+                finished_callback=finished_callback,
+                partial_tail_threshold=int(getattr(payload, "partial_tail_threshold", 0)),
             )
             if ctx.is_rank0:
                 return state.to_rollout()
@@ -257,6 +262,8 @@ class InferenceManager:
         cancel_flags: torch.Tensor | None = None,
         cancel_indices: list[int] | None = None,
         prompt_indices: list[int] | None = None,
+        finished_callback: FinishedRowsCallback | None = None,
+        partial_tail_threshold: int = 0,
     ) -> None:
         """Prefill all prompts then decode up to `max_new_tokens` without DP-sync.
 
@@ -296,6 +303,7 @@ class InferenceManager:
         # we still need *something* recognisable downstream as "stop".
         truncate_stop_token_ids = stop_token_ids if stop_token_ids else ([cancel_token] if cancel_flags is not None else [])
         prompt_indices_list = list(prompt_indices) if prompt_indices is not None else list(range(prompt_count))
+        partial_rows = torch.zeros(prompt_count, device=self.device, dtype=torch.bool)
 
         # generated/logprobs shape: (prompt_count, max_new_tokens), with only
         # the prefix [0:response_lens[i]] valid for row i.
@@ -319,12 +327,30 @@ class InferenceManager:
         # entering the decode loop, in case a prompt was already complete.
         if stop_token_ids:
             finished = _tokens_match_any(next_tokens, stop_token_ids)
-            self._mark_rollout_finished_rows(active_rows[finished], generated, logprobs, response_lens, "stop", prompt_indices_list)
+            self._mark_rollout_finished_rows(
+                active_rows[finished],
+                generated,
+                logprobs,
+                response_lens,
+                "stop",
+                prompt_indices_list,
+                finished_callback,
+                tuple(truncate_stop_token_ids),
+            )
             remove |= finished
             should_filter = True
         full_length = response_lens[active_rows] >= state.max_new_tokens
         if bool(full_length.any().item()):
-            self._mark_rollout_finished_rows(active_rows[full_length], generated, logprobs, response_lens, "length", prompt_indices_list)
+            self._mark_rollout_finished_rows(
+                active_rows[full_length],
+                generated,
+                logprobs,
+                response_lens,
+                "length",
+                prompt_indices_list,
+                finished_callback,
+                tuple(truncate_stop_token_ids),
+            )
             remove |= full_length
             should_filter = True
         cancelled = self._cancel_mask_for_active_rows(active_rows, cancel_flags, cancel_indices_tensor)
@@ -374,6 +400,8 @@ class InferenceManager:
                     eos_token_id,
                     sample_step,
                     stop_token_ids,
+                    finished_callback,
+                    tuple(truncate_stop_token_ids),
                 )
                 if admitted is None:
                     break
@@ -414,12 +442,30 @@ class InferenceManager:
             # EOS / stop-token filter.
             if stop_token_ids:
                 finished = _tokens_match_any(next_tokens, stop_token_ids)
-                self._mark_rollout_finished_rows(active_rows[finished], generated, logprobs, response_lens, "stop", prompt_indices_list)
+                self._mark_rollout_finished_rows(
+                    active_rows[finished],
+                    generated,
+                    logprobs,
+                    response_lens,
+                    "stop",
+                    prompt_indices_list,
+                    finished_callback,
+                    tuple(truncate_stop_token_ids),
+                )
                 remove |= finished
                 should_filter = True
             full_length = response_lens[active_rows] >= state.max_new_tokens
             if bool(full_length.any().item()):
-                self._mark_rollout_finished_rows(active_rows[full_length], generated, logprobs, response_lens, "length", prompt_indices_list)
+                self._mark_rollout_finished_rows(
+                    active_rows[full_length],
+                    generated,
+                    logprobs,
+                    response_lens,
+                    "length",
+                    prompt_indices_list,
+                    finished_callback,
+                    tuple(truncate_stop_token_ids),
+                )
                 remove |= full_length
                 should_filter = True
             # Cancellation filter (overrides the just-written token with the
@@ -442,9 +488,22 @@ class InferenceManager:
                 position_ids = position_ids[keep]
                 block_table = block_table[keep]
                 active_count = int(active_rows.numel())
+            if self._should_partial_tail(state, active_count, partial_tail_threshold):
+                partial_rows[active_rows] = True
+                self._free_rollout_rows(state, active_rows)
+                break
         # Any rows still active at this point hit the length cap.
-        if active_count > 0:
-            self._mark_rollout_finished_rows(active_rows, generated, logprobs, response_lens, "length", prompt_indices_list)
+        if active_count > 0 and not bool(partial_rows[active_rows].all().item()):
+            self._mark_rollout_finished_rows(
+                active_rows[~partial_rows[active_rows]],
+                generated,
+                logprobs,
+                response_lens,
+                "length",
+                prompt_indices_list,
+                finished_callback,
+                tuple(truncate_stop_token_ids),
+            )
         state.metrics["decode_scheduled_tokens"] = float(decoded_tokens)
         self._record_decode_progress(
             enabled=progress_enabled,
@@ -471,6 +530,8 @@ class InferenceManager:
             response_lengths = response_lens.detach().cpu().tolist()
             generated_rows = [row[: int(length)] for row, length in zip(generated.cpu().tolist(), response_lengths, strict=True)]
             generated_obj, finish_reason_obj = _truncate_generated(generated_rows, truncate_stop_token_ids)
+            partial_flags = partial_rows.detach().cpu().tolist()
+            finish_reason_obj = ["partial" if partial else reason for partial, reason in zip(partial_flags, finish_reason_obj, strict=True)]
             logprobs_rows = logprobs.cpu().tolist()
             logprobs_obj = [row[: len(generated_row)] for row, generated_row in zip(logprobs_rows, generated_obj, strict=True)]
         # broadcast_object src=0 of the TP group: rank 0 holds the canonical
@@ -483,6 +544,17 @@ class InferenceManager:
         state.logprobs = logprobs_obj
         state.finished = [True for _ in state.generated]
         state.finish_reason = finish_reason_obj
+
+    def _should_partial_tail(self, state: InferenceBatchState, active_count: int, partial_tail_threshold: int) -> bool:
+        """Return whether a small active tail should be resumed by a later batch."""
+
+        if partial_tail_threshold <= 0 or active_count <= 0:
+            return False
+        if active_count >= state.max_running_seqs:
+            return False
+        if state._pending_seq_id < len(state.prompts):
+            return False
+        return active_count <= int(partial_tail_threshold)
 
     def _record_decode_progress(
         self,
@@ -516,16 +588,16 @@ class InferenceManager:
                 return
             window_elapsed = max(now - self._decode_progress_window_start, 1e-9)
             window_tokens = int(self._decode_progress_window_tokens)
-            concurrent_rollouts = len(self._decode_progress_active)
+            concurrent_batches = len(self._decode_progress_active)
             total_active = sum(self._decode_progress_active.values())
             self._decode_progress_window_start = now
             self._decode_progress_next_time = now + interval_s
             self._decode_progress_window_tokens = 0
         logger.info(
-            "rollout decode progress: dp=%d/%d concurrent_rollouts=%d active=%d tokens_per_second=%.1f window_tokens=%d step=%d/%d cache_tokens=%d",
+            "rollout decode progress: dp=%d/%d concurrent_batches=%d active=%d tokens_per_second=%.1f window_tokens=%d step=%d/%d cache_tokens=%d",
             ctx.dp_rank,
             ctx.dp_size,
-            concurrent_rollouts,
+            concurrent_batches,
             total_active,
             window_tokens / window_elapsed,
             window_tokens,
@@ -579,6 +651,8 @@ class InferenceManager:
         eos_token_id: int | tuple[int, ...] | None,
         step: int,
         stop_token_ids: tuple[int, ...],
+        finished_callback: FinishedRowsCallback | None,
+        truncate_stop_token_ids: tuple[int, ...],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
         """Admit pending rows from the current rollout state only."""
 
@@ -603,7 +677,16 @@ class InferenceManager:
         new_block_table = prefill.block_table.to(self.device, non_blocking=True).int()
         if stop_token_ids:
             finished = _tokens_match_any(new_tokens, stop_token_ids)
-            self._mark_rollout_finished_rows(new_rows[finished], generated, logprobs, response_lens, "stop", prompt_indices)
+            self._mark_rollout_finished_rows(
+                new_rows[finished],
+                generated,
+                logprobs,
+                response_lens,
+                "stop",
+                prompt_indices,
+                finished_callback,
+                truncate_stop_token_ids,
+            )
             if bool(finished.any().item()):
                 self._free_rollout_rows(state, new_rows[finished])
                 keep = ~finished
@@ -614,7 +697,16 @@ class InferenceManager:
                 new_block_table = new_block_table[keep]
         full_length = response_lens[new_rows] >= state.max_new_tokens
         if bool(full_length.any().item()):
-            self._mark_rollout_finished_rows(new_rows[full_length], generated, logprobs, response_lens, "length", prompt_indices)
+            self._mark_rollout_finished_rows(
+                new_rows[full_length],
+                generated,
+                logprobs,
+                response_lens,
+                "length",
+                prompt_indices,
+                finished_callback,
+                truncate_stop_token_ids,
+            )
             self._free_rollout_rows(state, new_rows[full_length])
             keep = ~full_length
             new_rows = new_rows[keep]
@@ -634,10 +726,15 @@ class InferenceManager:
         response_lens: torch.Tensor,
         finish_reason: str,
         prompt_indices: list[int] | None = None,
+        finished_callback: FinishedRowsCallback | None = None,
+        truncate_stop_token_ids: tuple[int, ...] = (),
     ) -> None:
         """Finish hook; final rollout output carries completed rows."""
 
-        del rows, generated, logprobs, response_lens, finish_reason, prompt_indices
+        del prompt_indices
+        if rows.numel() == 0 or finished_callback is None or finish_reason == "partial":
+            return
+        finished_callback(rows, generated, logprobs, response_lens, finish_reason, truncate_stop_token_ids)
 
     @torch.inference_mode()
     def _infer_next_token_tensor(self, payload: PrefillPayload) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:

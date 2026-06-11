@@ -19,7 +19,8 @@ def _load_protocol_module():
     return module
 
 
-TPCluster = _load_protocol_module().TPCluster
+protocol = _load_protocol_module()
+TPCluster = protocol.TPCluster
 
 
 class FakeQueue:
@@ -81,6 +82,79 @@ class TPClusterResourceTest(unittest.TestCase):
         for queue in [*cluster.cmd_queues, cluster.result_queue]:
             self.assertTrue(queue.closed)
             self.assertTrue(queue.joined)
+
+    def test_coalesced_rollout_pending_ranks_follow_owner_dp(self):
+        """A coalesced request should only wait for ranks in the DP lane that owns rows."""
+
+        counts_by_dp = [
+            [1, 0, 1, 0],
+            [0, 1, 0, 1],
+        ]
+
+        self.assertEqual(protocol._coalesced_pending_ranks(counts_by_dp, 0, tp_size=2, world_size=4), {0, 1})
+        self.assertEqual(protocol._coalesced_pending_ranks(counts_by_dp, 1, tp_size=2, world_size=4), {2, 3})
+
+    def test_coalesced_rollout_merges_requests_with_different_capacity_limits(self):
+        """Serve requests with different prompt lengths should still share one rollout batch."""
+
+        def payload(prompt, *, max_cache_len, max_blocks_per_seq, max_prefill_tokens):
+            return protocol.RolloutPayload(
+                prompts_by_dp=[[prompt], []],
+                prompt_indices_by_dp=[[0], []],
+                max_new_tokens=16,
+                eos_token_id=1,
+                sampling_params=protocol.SamplingParams(temperature=0.7),
+                max_running_seqs=1,
+                max_cache_len=max_cache_len,
+                max_blocks_per_seq=max_blocks_per_seq,
+                max_prefill_tokens=max_prefill_tokens,
+                num_blocks=max_blocks_per_seq,
+                block_size=16,
+                coalesce_max_running_seqs=2,
+                coalesce_timeout_s=5.0,
+            )
+
+        short = payload([1, 2], max_cache_len=18, max_blocks_per_seq=2, max_prefill_tokens=4)
+        long = payload([3, 4, 5, 6], max_cache_len=20, max_blocks_per_seq=3, max_prefill_tokens=8)
+
+        self.assertTrue(protocol._rollout_payloads_compatible(short, long))
+        merged = protocol._merge_rollout_payloads_for_cluster([short, long], [10, 11])
+
+        self.assertEqual(merged.max_cache_len, 20)
+        self.assertEqual(merged.max_blocks_per_seq, 3)
+        self.assertEqual(merged.max_prefill_tokens, 8)
+        self.assertEqual(merged.num_blocks, 3)
+        self.assertEqual(merged.prompts_by_dp, [[[1, 2]], [[3, 4, 5, 6]]])
+        self.assertEqual(merged.coalesced_request_ids, [10, 11])
+        self.assertEqual(merged.coalesced_counts_by_dp, [[1, 0], [0, 1]])
+
+    def test_coalesced_rollout_recomputes_partial_tail_threshold_from_merged_batch(self):
+        """Single-request payloads should get a real tail cutoff after queue batching."""
+
+        payloads = [
+            protocol.RolloutPayload(
+                prompts_by_dp=[[[idx]]],
+                prompt_indices_by_dp=[[0]],
+                max_new_tokens=16,
+                eos_token_id=1,
+                sampling_params=protocol.SamplingParams(),
+                max_running_seqs=1,
+                max_cache_len=32,
+                max_blocks_per_seq=2,
+                max_prefill_tokens=16,
+                num_blocks=2,
+                block_size=16,
+                coalesce_max_running_seqs=16,
+                coalesce_timeout_s=5.0,
+                partial_tail_threshold=0,
+            )
+            for idx in range(16)
+        ]
+
+        merged = protocol._merge_rollout_payloads_for_cluster(payloads, list(range(16)))
+
+        self.assertEqual(merged.max_running_seqs, 16)
+        self.assertEqual(merged.partial_tail_threshold, 4)
 
 
 if __name__ == "__main__":

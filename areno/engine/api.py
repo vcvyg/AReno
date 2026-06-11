@@ -48,7 +48,22 @@ from areno.engine.runtime.common import (
     split_list_by_dp,
 )
 from areno.engine.runtime.decode_graph import ceil_div
-from areno.engine.runtime.rollout import _merge_dp_rollouts_in_input_order, _merge_rollouts
+from areno.engine.runtime.rollout import _build_rollout_from_rows, _merge_dp_rollouts_in_input_order, _merge_rollouts, partial_tail_threshold
+
+
+def _merge_async_dp_rollouts(outputs: list[RolloutOutput | None], *, total_count: int) -> RolloutOutput:
+    """Merge async DP results, allowing coalesced single-row requests to land on any DP."""
+
+    non_empty = [output for output in outputs if output is not None and len(output.prompt_ids) > 0]
+    if total_count == 1 and len(non_empty) == 1:
+        return non_empty[0]
+    try:
+        return _merge_dp_rollouts_in_input_order(outputs, total_count=total_count)
+    except RuntimeError as exc:
+        row_counts = [0 if output is None else len(output.prompt_ids) for output in outputs]
+        if sum(row_counts) == total_count:
+            return _merge_rollouts(non_empty)
+        raise RuntimeError(f"{exc}; async DP row_counts={row_counts} total_count={total_count}") from exc
 
 
 class ArenoEngine:
@@ -158,6 +173,7 @@ class ArenoEngine:
         eos_token_id: int | None = None,
         sampling_params: SamplingParams | None = None,
         decode_progress_interval_s: float = 0.0,
+        coalesce_timeout_s: float = 5.0,
         cancel_flags: torch.Tensor | None = None,
     ) -> RolloutOutput:
         """Generate rollout tokens for pre-tokenized prompts.
@@ -259,8 +275,52 @@ class ArenoEngine:
         sampling_params: SamplingParams | None = None,
         decode_progress_interval_s: float = 0.0,
         cancel_flags: torch.Tensor | None = None,
+        coalesce_timeout_s: float = 5.0,
     ) -> RolloutOutput:
-        """Async rollout path using TPCluster request-id demux."""
+        """Async rollout path using TPCluster request-id demux.
+
+        Coalesced async rollouts may cut small active tails as ``partial``.
+        Those rows are transparently resumed as ``prompt + generated`` so HTTP
+        and agentic callers still receive a single completed rollout row.
+        """
+
+        output = await self._generate_rollout_async_once(
+            prompts,
+            max_new_tokens=max_new_tokens,
+            max_running_prompts=max_running_prompts,
+            max_prompt_len=max_prompt_len,
+            eos_token_id=eos_token_id,
+            sampling_params=sampling_params,
+            decode_progress_interval_s=decode_progress_interval_s,
+            cancel_flags=cancel_flags,
+            coalesce_timeout_s=coalesce_timeout_s,
+        )
+        if cancel_flags is not None:
+            return output
+        return await self._complete_partial_async_rollout(
+            output,
+            max_new_tokens=max_new_tokens,
+            max_running_prompts=max_running_prompts,
+            eos_token_id=eos_token_id,
+            sampling_params=sampling_params or SamplingParams(),
+            decode_progress_interval_s=decode_progress_interval_s,
+            coalesce_timeout_s=coalesce_timeout_s,
+        )
+
+    async def _generate_rollout_async_once(
+        self,
+        prompts: list[list[int]],
+        *,
+        max_new_tokens: int,
+        max_running_prompts: int,
+        max_prompt_len: int | None = None,
+        eos_token_id: int | None = None,
+        sampling_params: SamplingParams | None = None,
+        decode_progress_interval_s: float = 0.0,
+        cancel_flags: torch.Tensor | None = None,
+        coalesce_timeout_s: float = 5.0,
+    ) -> RolloutOutput:
+        """Run one async rollout pass without resolving ``partial`` rows."""
 
         if not prompts:
             raise ValueError("prompts must be non-empty")
@@ -286,34 +346,93 @@ class ArenoEngine:
             current_local_running = max(max((len(rows) for rows in prompts_by_dp), default=0), 1)
             max_cache_len = max(max(len(prompt) + max_new_tokens for prompt in chunk), rollout_max_cache_len)
             max_blocks_per_seq = ceil_div(max_cache_len, self.config.runtime.kv_block_size)
+            payload = RolloutPayload(
+                prompts_by_dp=prompts_by_dp,
+                prompt_indices_by_dp=prompt_indices_by_dp,
+                max_new_tokens=max_new_tokens,
+                eos_token_id=eos_token_id,
+                sampling_params=sampling_params,
+                max_running_seqs=current_local_running,
+                max_cache_len=max_cache_len,
+                max_blocks_per_seq=max_blocks_per_seq,
+                max_prefill_tokens=max_prefill_tokens,
+                num_blocks=current_local_running * max_blocks_per_seq,
+                block_size=self.config.runtime.kv_block_size,
+                decode_progress_interval_s=decode_progress_interval_s,
+                cancel_flags=cancel_flags,
+                cancel_indices_by_dp=split_list_by_dp(list(range(chunk_start, chunk_start + len(chunk))), dp_size)
+                if cancel_flags is not None
+                else None,
+                coalesce_max_running_seqs=local_max_running_prompts,
+                coalesce_timeout_s=max(float(coalesce_timeout_s), 0.0),
+            )
+            if hasattr(payload, "partial_tail_threshold"):
+                payload.partial_tail_threshold = partial_tail_threshold(current_local_running, coalesce_timeout_s)
             results = await self.cluster.call_async(
                 Op.INFER_ROLLOUT,
-                RolloutPayload(
-                    prompts_by_dp=prompts_by_dp,
-                    prompt_indices_by_dp=prompt_indices_by_dp,
-                    max_new_tokens=max_new_tokens,
-                    eos_token_id=eos_token_id,
-                    sampling_params=sampling_params,
-                    max_running_seqs=current_local_running,
-                    max_cache_len=max_cache_len,
-                    max_blocks_per_seq=max_blocks_per_seq,
-                    max_prefill_tokens=max_prefill_tokens,
-                    num_blocks=current_local_running * max_blocks_per_seq,
-                    block_size=self.config.runtime.kv_block_size,
-                    decode_progress_interval_s=decode_progress_interval_s,
-                    cancel_flags=cancel_flags,
-                    cancel_indices_by_dp=split_list_by_dp(list(range(chunk_start, chunk_start + len(chunk))), dp_size)
-                    if cancel_flags is not None
-                    else None,
-                ),
+                payload,
             )
             outputs.append(
-                _merge_dp_rollouts_in_input_order(
-                    dp_rank0_results(results, self.config.tp_size, dp_size),
-                    total_count=len(chunk),
-                )
+                _merge_async_dp_rollouts(dp_rank0_results(results, self.config.tp_size, dp_size), total_count=len(chunk))
             )
         return outputs[0] if len(outputs) == 1 else _merge_rollouts(outputs)
+
+    async def _complete_partial_async_rollout(
+        self,
+        output: RolloutOutput,
+        *,
+        max_new_tokens: int,
+        max_running_prompts: int,
+        eos_token_id: int | None,
+        sampling_params: SamplingParams,
+        decode_progress_interval_s: float,
+        coalesce_timeout_s: float,
+    ) -> RolloutOutput:
+        """Resume ``partial`` rows until every async rollout row is complete."""
+
+        prompt_rows = [list(row) for row in output.prompt_ids]
+        response_rows = [list(row) for row in output.response_ids]
+        finish_reason = list(output.finish_reason)
+        logprob_rows = [output.logprobs[row_idx, : len(response)].detach().cpu() for row_idx, response in enumerate(response_rows)]
+
+        while True:
+            partial_indices = [
+                row_idx
+                for row_idx, reason in enumerate(finish_reason)
+                if reason == "partial" and len(response_rows[row_idx]) < max_new_tokens
+            ]
+            if not partial_indices:
+                break
+            groups: dict[int, list[int]] = {}
+            for row_idx in partial_indices:
+                remaining = max_new_tokens - len(response_rows[row_idx])
+                groups.setdefault(remaining, []).append(row_idx)
+            for remaining, row_indices in groups.items():
+                continuation_prompts = [prompt_rows[row_idx] + response_rows[row_idx] for row_idx in row_indices]
+                continuation = await self._generate_rollout_async_once(
+                    continuation_prompts,
+                    max_new_tokens=remaining,
+                    max_running_prompts=max_running_prompts,
+                    max_prompt_len=None,
+                    eos_token_id=eos_token_id,
+                    sampling_params=sampling_params,
+                    decode_progress_interval_s=decode_progress_interval_s,
+                    cancel_flags=None,
+                    coalesce_timeout_s=coalesce_timeout_s,
+                )
+                for local_idx, row_idx in enumerate(row_indices):
+                    next_response = continuation.response_ids[local_idx]
+                    if continuation.finish_reason[local_idx] == "partial" and not next_response:
+                        finish_reason[row_idx] = "length"
+                        continue
+                    response_rows[row_idx].extend(next_response)
+                    next_logprobs = continuation.logprobs[local_idx, : len(next_response)].detach().cpu()
+                    logprob_rows[row_idx] = torch.cat([logprob_rows[row_idx], next_logprobs]) if logprob_rows[row_idx].numel() else next_logprobs
+                    finish_reason[row_idx] = continuation.finish_reason[local_idx]
+            if all(reason != "partial" or len(response_rows[row_idx]) >= max_new_tokens for row_idx, reason in enumerate(finish_reason)):
+                break
+        finish_reason = ["length" if reason == "partial" else reason for reason in finish_reason]
+        return _build_rollout_from_rows(prompt_rows, response_rows, finish_reason, logprob_rows, metrics=output.metrics)
 
     def step(self, data_packs: list[dict[str, Any]], *, gradient_accumulation_steps: int | None = None) -> list[TrainStats]:
         """Run one or more train data packs through the DP/TP worker cluster.

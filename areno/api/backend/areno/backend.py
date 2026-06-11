@@ -32,6 +32,7 @@ from areno.api.backend.base import Backend, register_backend
 
 
 logger = logging.getLogger(__name__)
+ROLLOUT_COALESCE_WAIT_S = 2.0
 _SYS_PATH_LOCK = Lock()
 _SYS_PATH_PREFERRED = False
 
@@ -270,6 +271,7 @@ class ArenoBackend(Backend):
                 max_prompt_len=options["max_prompt_len"],
                 eos_token_id=options["eos_token_id"],
                 decode_progress_interval_s=options["decode_progress_interval_s"],
+                coalesce_timeout_s=ROLLOUT_COALESCE_WAIT_S,
                 sampling_params=options["sampling_params"],
             )
         finally:
