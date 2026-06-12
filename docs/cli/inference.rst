@@ -4,9 +4,9 @@ Inference CLI reference
 ``areno serve``
 
 Start an OpenAI-compatible HTTP server backed by the Areno inference engine.
-The server exposes ``/v1/chat/completions`` and keeps one rollout session open
-for the process lifetime so rollout state and CUDA graph state can be reused
-across requests.
+The server exposes ``/v1/chat/completions``, accepts standard chat-completion
+``tools`` fields, and keeps one rollout session open for the process lifetime
+so rollout state and CUDA graph state can be reused across requests.
 
 .. code-block:: bash
 
@@ -140,6 +140,14 @@ Request fields
    * - ``seed``
      - ``int | None``
      - Deterministic sampling seed when sampling is enabled.
+   * - ``tools``
+     - ``list[Tool] | None``
+     - OpenAI-compatible function tools. The same model-native tool-call
+       parser used by agentic rollout converts generated tool-call text into
+       ``message.tool_calls`` for supported model families.
+   * - ``tool_choice``
+     - ``str | dict | None``
+     - Optional tool-choice directive, including a forced function name.
 ``ChatMessage`` fields:
 
 ``role``
@@ -185,15 +193,14 @@ eagerly.
 Tool calls
 ----------
 
-Tool-call training uses the agentic rollout proxy rather than standalone
-``areno serve``. In an agent function, point an OpenAI client at
-``ctx.get_base_url()`` and pass Chat Completions ``tools`` and ``tool_choice``:
+``areno serve`` supports the Chat Completions tool-call shape and reuses the
+same tool-call parser as agentic rollout:
 
 .. code-block:: python
 
    from openai import OpenAI
 
-   client = OpenAI(base_url=ctx.get_base_url(), api_key=ctx.api_key)
+   client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="unused")
    response = client.chat.completions.create(
        model="areno",
        messages=[{"role": "user", "content": "Choose a move: left or right."}],
@@ -219,9 +226,7 @@ Tool-call training uses the agentic rollout proxy rather than standalone
 
 Tool-call parsing is selected from the model/tokenizer family. Current parsers
 cover Qwen/Qwen3.5/MiniCPM-style ``<tool_call>`` blocks, Gemma4 tool-call
-blocks, and generic JSON tool-call output. The agent function returns the
-OpenAI response in an ``AgentTrajectoryTurn`` so the trainer can build
-token/logprob/reward/loss-mask rows.
+blocks, and generic JSON tool-call output.
 
 Help
 ----

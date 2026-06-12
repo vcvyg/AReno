@@ -572,11 +572,17 @@ class InferenceManager:
                 self._decode_progress_active[rollout_key] = active_count
             else:
                 self._decode_progress_active.pop(rollout_key, None)
-            self._decode_progress_window_tokens += int(token_delta)
+            # Start the reporting window on the first decoded token, not on
+            # prefill/admission bookkeeping. Otherwise serve workloads with
+            # short prompts or frequent refill report artificially low decode
+            # throughput because prefill time is charged to decode tokens.
             if self._decode_progress_next_time <= 0.0:
+                if token_delta <= 0:
+                    return
                 self._decode_progress_window_start = now
                 self._decode_progress_next_time = now + interval_s
                 return
+            self._decode_progress_window_tokens += int(token_delta)
             if now < self._decode_progress_next_time:
                 return
             window_elapsed = max(now - self._decode_progress_window_start, 1e-9)

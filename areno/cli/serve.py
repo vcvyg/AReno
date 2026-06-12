@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -19,6 +18,8 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from areno.cli.model_refs import resolve_model_ref
+from areno.api.openai_chat import build_chat_completion_response, messages_to_prompt_tokens
+from areno.api.tool_call_parser import ToolCallParser, get_tool_call_parser, infer_tool_call_parser_name
 from areno.engine.config import RuntimeConfig
 from areno.engine.data import SamplingParams
 from areno.engine.data.tokenizer import load_tokenizer
@@ -35,14 +36,18 @@ class ChatMessage(BaseModel):
 
     role: Literal["system", "user", "assistant", "tool"] | str
     content: str | list[Any] | None = None
+    name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class ChatCompletionRequest(BaseModel):
     """Subset of the OpenAI chat-completions request schema accepted by this server."""
 
-
     model: str | None = None
     messages: list[ChatMessage]
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
     max_tokens: int | None = Field(default=None, ge=1)
     max_completion_tokens: int | None = Field(default=None, ge=1)
     temperature: float = Field(default=0.0, ge=0.0)
@@ -58,7 +63,7 @@ class ChatCompletionChoice(BaseModel):
     """One generated completion within a response, indexed by `n` position."""
 
     index: int
-    message: dict[str, str]
+    message: dict[str, Any]
     finish_reason: str
 
 
@@ -128,9 +133,21 @@ class ServeState:
     max_running_prompts: int
     default_max_tokens: int
     max_model_len: int
+    tool_call_parser: ToolCallParser
     active_tasks: set[asyncio.Task] = field(default_factory=set)
     closing: bool = False
     rollout_session_started: bool = False
+
+
+class _ToolParserTrainerShim:
+    """Adapter used to infer the shared tool-call parser in serve mode."""
+
+    def __init__(self, *, model_path: str, tokenizer: Any) -> None:
+        self._model_path = model_path
+        self._tokenizer = tokenizer
+
+    def get_tokenizer(self) -> Any:
+        return self._tokenizer
 
 
 def create_app(
@@ -152,6 +169,7 @@ def create_app(
         raise ValueError("world_size must be divisible by tp_size")
 
     tokenizer = load_tokenizer(model_path)
+    parser_trainer = _ToolParserTrainerShim(model_path=model_path, tokenizer=tokenizer)
     engine = ArenoEngine.from_pretrained(
         model_path,
         tp_size=tp_size,
@@ -167,6 +185,7 @@ def create_app(
         max_running_prompts=max_running_prompts,
         default_max_tokens=default_max_tokens,
         max_model_len=int(engine.config.model.max_position_embeddings),
+        tool_call_parser=get_tool_call_parser(infer_tool_call_parser_name(parser_trainer)),
     )
     app = FastAPI(title="areno OpenAI-compatible server")
     app.state.areno_serve = state
@@ -222,7 +241,7 @@ def create_app(
         if not request.messages:
             raise HTTPException(status_code=400, detail="messages must be non-empty")
 
-        prompt = _encode_messages(state.tokenizer, request.messages)
+        prompt = _encode_messages(state.tokenizer, request.messages, tools=request.tools)
         key = BatchKey(
             max_new_tokens=int(request.max_completion_tokens or request.max_tokens or state.default_max_tokens),
             temperature=float(request.temperature),
@@ -347,58 +366,53 @@ def _build_response(
     finish_reasons: list[str],
 ) -> ChatCompletionResponse:
     """Thin shim that forwards to `_build_response_from` using state's tokenizer/model_path."""
-    return _build_response_from(state.tokenizer, state.model_path, request, prompt, response_ids, finish_reasons)
+    return _build_response_from(state.tokenizer, state.model_path, state.tool_call_parser, request, prompt, response_ids, finish_reasons)
 
 
 def _build_response_from(
     tokenizer: Any,
     model_path: str,
+    tool_call_parser: ToolCallParser,
     request: ChatCompletionRequest,
     prompt: list[int],
     response_ids: list[list[int]],
     finish_reasons: list[str],
 ) -> ChatCompletionResponse:
-    """Decode token ids back to text, apply stop-string trimming, assemble the OpenAI envelope."""
-    stop_strings = _normalize_stop(request.stop)
-    choices: list[ChatCompletionChoice] = []
-    completion_tokens = 0
-    for index, token_ids in enumerate(response_ids):
-        text = tokenizer.decode(token_ids, skip_special_tokens=True)
-        text, stop_hit = _trim_stop_strings(text, stop_strings)
-        completion_tokens += len(token_ids)
-        finish_reason = "stop" if stop_hit or finish_reasons[index] == "stop" else "length"
-        choices.append(
-            ChatCompletionChoice(
-                index=index,
-                message={"role": "assistant", "content": text},
-                finish_reason=finish_reason,
-            )
-        )
-    prompt_tokens = len(prompt) * len(response_ids)
-    return ChatCompletionResponse(
-        id=f"chatcmpl-{uuid.uuid4().hex}",
-        created=int(time.time()),
+    """Decode token ids, parse optional tool calls, and assemble the OpenAI envelope."""
+
+    data = build_chat_completion_response(
+        tokenizer=tokenizer,
         model=request.model or model_path,
-        choices=choices,
-        usage=ChatCompletionUsage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
+        prompt_tokens=len(prompt) * len(response_ids),
+        response_ids=response_ids,
+        finish_reasons=finish_reasons,
+        tools=request.tools,
+        tool_choice=request.tool_choice,
+        tool_call_parser=tool_call_parser,
+        stop_strings=_normalize_stop(request.stop),
     )
+    return ChatCompletionResponse(**data)
 
 
-def _encode_messages(tokenizer: Any, messages: list[ChatMessage]) -> list[int]:
+def _encode_messages(tokenizer: Any, messages: list[ChatMessage], *, tools: list[dict[str, Any]] | None = None) -> list[int]:
     """Tokenise a chat history, using the tokenizer's chat template when available."""
-    payload = [{"role": msg.role, "content": _message_content(msg.content)} for msg in messages]
-    if getattr(tokenizer, "chat_template", None):
-        return tokenizer.apply_chat_template(
-            payload,
-            tokenize=True,
-            add_generation_prompt=True,
-        )
-    text = "\n".join(f"{msg['role']}: {msg['content']}" for msg in payload) + "\nassistant:"
-    return tokenizer.encode(text, add_special_tokens=True)
+    payload = [_chat_message_payload(msg) for msg in messages]
+    return messages_to_prompt_tokens(tokenizer, payload, tools=tools, fallback_prompt=_messages_fallback_text(payload))
+
+
+def _chat_message_payload(message: ChatMessage) -> dict[str, Any]:
+    payload: dict[str, Any] = {"role": message.role, "content": _message_content(message.content)}
+    if message.name is not None:
+        payload["name"] = message.name
+    if message.tool_call_id is not None:
+        payload["tool_call_id"] = message.tool_call_id
+    if message.tool_calls is not None:
+        payload["tool_calls"] = message.tool_calls
+    return payload
+
+
+def _messages_fallback_text(messages: list[dict[str, Any]]) -> str:
+    return "\n".join(f"{msg['role']}: {msg.get('content', '')}" for msg in messages) + "\nassistant:"
 
 
 def _message_content(content: str | list[Any] | None) -> str:
@@ -444,20 +458,6 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str]:
     if isinstance(stop, str):
         return [stop]
     return [value for value in stop if value]
-
-
-def _trim_stop_strings(text: str, stop: list[str]) -> tuple[str, bool]:
-    """Trim `text` at the earliest occurrence of any stop string; return (trimmed, hit?)."""
-    if not stop:
-        return text, False
-    first = None
-    for marker in stop:
-        idx = text.find(marker)
-        if idx >= 0 and (first is None or idx < first):
-            first = idx
-    if first is None:
-        return text, False
-    return text[:first], True
 
 
 @click.command(

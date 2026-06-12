@@ -1,8 +1,8 @@
 """Agentic rollout session support.
 
-This module provides the first agentic rollout path for Areno. It exposes a
-small OpenAI-compatible HTTP surface that agent code can call with a standard
-OpenAI client, records the generated trajectories, and converts them into the
+This module provides the agentic rollout path for Areno. It exposes a small
+OpenAI-compatible HTTP surface that agent code can call with a standard OpenAI
+client. Agent code returns explicit trajectories, which are converted into the
 same token/logprob rows consumed by existing trainers.
 
 The first implementation intentionally supports non-streaming
@@ -28,6 +28,13 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
+from areno.api.openai_chat import (
+    build_chat_completion_response,
+    first_user_text,
+    messages_to_prompt_tokens,
+    messages_to_text,
+    normalize_messages,
+)
 from areno.api.tool_call_parser import get_tool_call_parser, infer_tool_call_parser_name
 
 if TYPE_CHECKING:
@@ -676,35 +683,22 @@ class RolloutSession:
         content: str | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        content = content if content is not None else self._trainer.get_tokenizer().decode(response_tokens)
-        message = {"role": "assistant", "content": content}
-        finish_reason = "stop"
-        if tool_calls:
-            message = {"role": "assistant", "content": None, "tool_calls": tool_calls}
-            finish_reason = "tool_calls"
-        return {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": pending.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": message,
-                    "finish_reason": finish_reason,
-                }
-            ],
-            "usage": {
-                "prompt_tokens": len(pending.input_tokens),
-                "completion_tokens": len(response_tokens),
-                "total_tokens": len(pending.input_tokens) + len(response_tokens),
-            },
-            "areno": {
-                "input_tokens": list(pending.input_tokens),
-                "response_tokens": list(response_tokens),
-                "response_logprobs": list(response_logprobs or []),
-            },
-        }
+        del content
+        finish_reason = "tool_calls" if tool_calls else "stop"
+        return build_chat_completion_response(
+            tokenizer=self._trainer.get_tokenizer(),
+            model=pending.model,
+            prompt_tokens=len(pending.input_tokens),
+            response_ids=[list(response_tokens)],
+            finish_reasons=[finish_reason],
+            tools=pending.tools,
+            tool_choice=pending.tool_choice,
+            tool_call_parser=self._tool_call_parser,
+            parsed_tool_calls=[list(tool_calls or [])],
+            response_logprobs=[list(response_logprobs or [])],
+            include_areno_metadata=True,
+            input_tokens=pending.input_tokens,
+        )
 
 
 def load_agent_run_fn(path: str) -> Callable[[RolloutSession, AgentBatch], Any]:
@@ -723,19 +717,7 @@ def load_agent_run_fn(path: str) -> Callable[[RolloutSession, AgentBatch], Any]:
 
 
 def _messages_to_prompt_tokens(tokenizer, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None, fallback_prompt: str) -> list[int]:
-    messages = _normalize_messages(messages)
-    if getattr(tokenizer, "chat_template", None):
-        kwargs: dict[str, Any] = {"tokenize": True, "add_generation_prompt": True}
-        if tools:
-            kwargs["tools"] = tools
-        try:
-            # Use the model's own chat template so assistant/tool messages are
-            # tokenized exactly as they were shown to the model.
-            return tokenizer.apply_chat_template(messages, **kwargs)
-        except TypeError:
-            kwargs.pop("tools", None)
-            return tokenizer.apply_chat_template(messages, **kwargs)
-    return tokenizer.encode(_messages_to_text(messages) or fallback_prompt)
+    return messages_to_prompt_tokens(tokenizer, messages, tools=tools, fallback_prompt=fallback_prompt)
 
 
 def _chat_response_agentic_metadata(response: Any) -> dict[str, Any]:
@@ -813,32 +795,15 @@ def _filtered_chat_response(*, model: str, prompt_tokens: int, max_sequence_len:
 
 
 def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    normalized = []
-    for message in messages:
-        item = dict(message)
-        # OpenAI chat-completions assistant tool-call messages commonly carry
-        # content=null. Some local chat templates treat content as a string, so
-        # normalize it before tokenization while preserving tool_calls.
-        if item.get("content") is None:
-            item["content"] = ""
-        normalized.append(item)
-    return normalized
+    return normalize_messages(messages)
 
 
 def _messages_to_text(messages: list[dict[str, Any]]) -> str:
-    parts = []
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, str):
-            parts.append(content)
-    return "\n".join(parts)
+    return messages_to_text(messages)
 
 
 def _first_user_text(messages: list[dict[str, Any]]) -> str:
-    for message in messages:
-        if message.get("role") == "user" and isinstance(message.get("content"), str):
-            return str(message["content"])
-    return _messages_to_text(messages)
+    return first_user_text(messages)
 
 
 def _response_kind(content: str) -> Literal["assistant_text", "assistant_tool_call"]:

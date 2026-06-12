@@ -318,6 +318,25 @@ def test_decode_progress_log_is_worker_aggregated(monkeypatch):
     assert "cache_tokens=" not in messages[0]
 
 
+def test_decode_progress_window_does_not_start_before_decode_tokens(monkeypatch):
+    """Prefill/admission bookkeeping should not dilute decode token/s."""
+
+    manager = _FakeInferenceManager()
+    ctx = SimpleNamespace(is_rank0=True, dp_rank=0, dp_size=1)
+    monkeypatch.setattr(inference_mod.logger, "info", lambda *args: None)
+
+    with PatchedContext(inference_mod, get_tp_context=lambda: ctx):
+        manager._record_decode_progress(
+            enabled=True,
+            interval_s=10.0,
+            rollout_key=1,
+            active_count=0,
+            token_delta=0,
+        )
+
+    assert manager._decode_progress_next_time == 0.0
+
+
 def test_worker_early_finished_rows_build_per_request_rollout():
     """A finished row can be converted to its request output before the batch ends."""
 
