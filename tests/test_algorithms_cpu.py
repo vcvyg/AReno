@@ -4,10 +4,10 @@ import functools
 import unittest
 
 from areno.api.algorithms import AlgorithmSpec, get_algorithm, list_algorithms, register_algorithm
-from areno.api.trainer_config import PolicyTrainerConfig, TrainerConfig
-from areno.api.trainer_factory import build_trainer
 from areno.api.loss_fns.gspo import gspo_loss_fn
 from areno.api.loss_fns.ppo import ppo_loss_fn
+from areno.api.trainer_config import PolicyTrainerConfig, TrainerConfig
+from areno.api.trainer_factory import build_trainer
 
 
 class AlgorithmRegistryTest(unittest.TestCase):

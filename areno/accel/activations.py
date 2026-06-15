@@ -7,6 +7,7 @@ input requires gradients. The ``*_and_mul`` variants implement the common
 first half is activated then element-wise multiplied with the second half,
 producing an output with half the last-dimension size.
 """
+
 import torch
 
 from areno.accel._extension import extension as _extension

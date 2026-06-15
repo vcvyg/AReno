@@ -188,8 +188,15 @@ def save_gemma4_mlp(tensors, prefix: str, layer, context) -> None:
 
     del context
     mlp = layer.mlp
-    save_split_column_spec(tensors, mlp, prefix, SplitColumnSpec("gate_up_proj.weight", "gate_up_proj.local_out_features", GATE_UP_WEIGHT_SPEC.keys))
-    save_parallel_tensors(tensors, mlp, prefix, (ParallelTensorSpec(MLP_ROW_SPEC.key, "down_proj.weight", MLP_ROW_SPEC.dim),))
+    save_split_column_spec(
+        tensors,
+        mlp,
+        prefix,
+        SplitColumnSpec("gate_up_proj.weight", "gate_up_proj.local_out_features", GATE_UP_WEIGHT_SPEC.keys),
+    )
+    save_parallel_tensors(
+        tensors, mlp, prefix, (ParallelTensorSpec(MLP_ROW_SPEC.key, "down_proj.weight", MLP_ROW_SPEC.dim),)
+    )
     if getattr(layer, "moe", None) is not None:
         _save_gemma4_moe(tensors, prefix, layer)
 
@@ -231,8 +238,16 @@ def _load_gemma4_moe(layer, index, prefix: str, rank: int, world_size: int) -> N
     moe = layer.moe
     if router is None or moe is None:
         return
-    router.scale.copy_(_get_existing_tensor(index, (f"{prefix}.router.scale", f"{prefix}.router.scale.weight")).to(dtype=router.scale.dtype))
-    router.proj.weight.copy_(_get_existing_tensor(index, (f"{prefix}.router.proj.weight", f"{prefix}.router.weight")).to(dtype=router.proj.weight.dtype))
+    router.scale.copy_(
+        _get_existing_tensor(index, (f"{prefix}.router.scale", f"{prefix}.router.scale.weight")).to(
+            dtype=router.scale.dtype
+        )
+    )
+    router.proj.weight.copy_(
+        _get_existing_tensor(index, (f"{prefix}.router.proj.weight", f"{prefix}.router.weight")).to(
+            dtype=router.proj.weight.dtype
+        )
+    )
     scale_keys = (f"{prefix}.router.per_expert_scale", f"{prefix}.moe.per_expert_scale")
     if any(k in index.weight_map for k in scale_keys):
         moe.per_expert_scale.copy_(_get_existing_tensor(index, scale_keys).to(dtype=moe.per_expert_scale.dtype))
@@ -241,8 +256,18 @@ def _load_gemma4_moe(layer, index, prefix: str, rank: int, world_size: int) -> N
 
 def _load_gemma4_experts(index, experts, prefix: str, rank: int, world_size: int) -> None:
     del rank, world_size
-    gate_up_key = next((k for k in (f"{prefix}.experts.gate_up_proj", f"{prefix}.experts.gate_up_proj.weight") if k in index.weight_map), None)
-    down_key = next((k for k in (f"{prefix}.experts.down_proj", f"{prefix}.experts.down_proj.weight") if k in index.weight_map), None)
+    gate_up_key = next(
+        (
+            k
+            for k in (f"{prefix}.experts.gate_up_proj", f"{prefix}.experts.gate_up_proj.weight")
+            if k in index.weight_map
+        ),
+        None,
+    )
+    down_key = next(
+        (k for k in (f"{prefix}.experts.down_proj", f"{prefix}.experts.down_proj.weight") if k in index.weight_map),
+        None,
+    )
     if gate_up_key is not None and down_key is not None:
         gate_up = index.get_tensor(gate_up_key)
         down = index.get_tensor(down_key)

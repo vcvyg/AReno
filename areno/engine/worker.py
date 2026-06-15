@@ -22,17 +22,18 @@ import torch.distributed as dist
 
 from areno.engine.config import EngineConfig
 from areno.engine.data import RolloutOutput
+from areno.engine.data.sampling import _truncate_generated
 from areno.engine.inference import InferenceManager
 from areno.engine.modeling import build_model_on_device, build_optimizer, param_grad
-from areno.engine.data.sampling import _truncate_generated
+from areno.engine.parallel.context import get_tp_context
 from areno.engine.protocol import Command, Op, RolloutPayload, SaveCheckpointPayload, WorkerResult
 from areno.engine.roles import RoleManager, WorkerRole
 from areno.engine.runtime.common import pad_rollout_rows
+from areno.engine.runtime.decode_graph import DecodeGraph
 from areno.engine.runtime.rollout import _empty_rollout
 from areno.engine.training import TrainingManager
-from areno.engine.parallel.context import get_tp_context
 from areno.models.registry import load_model_weights, save_model_weights
-from areno.engine.runtime.decode_graph import DecodeGraph
+
 
 class ArenoWorker:
     """Single-rank executor for model work.
@@ -152,8 +153,17 @@ class ArenoWorker:
                 if request_idx in sent or count != 0:
                     continue
                 request_id = request_ids[request_idx]
-                self._result_queue.put((self._rank, WorkerResult(ok=True, payload=_empty_rollout() if ctx.is_rank0 else None, request_id=request_id)))
-                self._current_request_ids = [pending_id for pending_id in self._current_request_ids if pending_id != request_id]
+                self._result_queue.put(
+                    (
+                        self._rank,
+                        WorkerResult(
+                            ok=True, payload=_empty_rollout() if ctx.is_rank0 else None, request_id=request_id
+                        ),
+                    )
+                )
+                self._current_request_ids = [
+                    pending_id for pending_id in self._current_request_ids if pending_id != request_id
+                ]
                 sent.add(request_idx)
 
         def send_finished(
@@ -184,8 +194,12 @@ class ArenoWorker:
                         truncate_stop_token_ids,
                     )
                 request_id = request_ids[request_idx]
-                self._result_queue.put((self._rank, WorkerResult(ok=True, payload=result_payload, request_id=request_id)))
-                self._current_request_ids = [pending_id for pending_id in self._current_request_ids if pending_id != request_id]
+                self._result_queue.put(
+                    (self._rank, WorkerResult(ok=True, payload=result_payload, request_id=request_id))
+                )
+                self._current_request_ids = [
+                    pending_id for pending_id in self._current_request_ids if pending_id != request_id
+                ]
                 sent.add(request_idx)
 
         send_empty_requests()
@@ -223,7 +237,11 @@ class ArenoWorker:
 
         output = self.infer_rollout(payload, finished_callback=send_finished, refill_callback=refill_waiting)
         parts = _split_rollout_output_by_rows(output, request_rows)
-        return [(request_id, part) for idx, (request_id, part) in enumerate(zip(request_ids, parts, strict=True)) if idx not in sent]
+        return [
+            (request_id, part)
+            for idx, (request_id, part) in enumerate(zip(request_ids, parts, strict=True))
+            if idx not in sent
+        ]
 
     def _next_refill_command(self) -> Command | None:
         """Fetch the next queued command consistently across TP ranks."""
@@ -289,7 +307,10 @@ class ArenoWorker:
             torch.cuda.synchronize(self.device)
         if ctx.group is not None:
             if ctx.device.type == "cuda":
-                dist.barrier(group=ctx.group, device_ids=[ctx.device.index if ctx.device.index is not None else torch.cuda.current_device()])
+                dist.barrier(
+                    group=ctx.group,
+                    device_ids=[ctx.device.index if ctx.device.index is not None else torch.cuda.current_device()],
+                )
             else:
                 dist.barrier(group=ctx.group)
         if self.device.type == "cuda":
@@ -449,7 +470,9 @@ def _split_rollout_output(output: RolloutOutput | None, counts: list[int]) -> li
     return parts
 
 
-def _split_rollout_output_by_rows(output: RolloutOutput | None, request_rows: list[list[int]]) -> list[RolloutOutput | None]:
+def _split_rollout_output_by_rows(
+    output: RolloutOutput | None, request_rows: list[list[int]]
+) -> list[RolloutOutput | None]:
     """Split a merged worker rollout by explicit state row ids."""
 
     if output is None:
@@ -496,11 +519,16 @@ def _build_rollout_from_tensor_row_ids(
         return _empty_rollout()
     prompt_ids = [prompts[row] for row in row_ids]
     lengths = response_lens[row_ids].detach().cpu().tolist()
-    generated_rows = [row[: int(length)] for row, length in zip(generated[row_ids].detach().cpu().tolist(), lengths, strict=True)]
+    generated_rows = [
+        row[: int(length)] for row, length in zip(generated[row_ids].detach().cpu().tolist(), lengths, strict=True)
+    ]
     response_ids, truncated_finish_reasons = _truncate_generated(generated_rows, truncate_stop_token_ids)
     finish_reason = [finish_reasons[row] or truncated_finish_reasons[idx] for idx, row in enumerate(row_ids)]
     logprob_rows_cpu = logprobs[row_ids].detach().cpu().tolist()
-    logprob_rows = [torch.tensor(row[: len(response)], dtype=torch.float32) for row, response in zip(logprob_rows_cpu, response_ids, strict=True)]
+    logprob_rows = [
+        torch.tensor(row[: len(response)], dtype=torch.float32)
+        for row, response in zip(logprob_rows_cpu, response_ids, strict=True)
+    ]
     input_ids, attention_mask, response_mask, padded_logprobs = pad_rollout_rows(prompt_ids, response_ids, logprob_rows)
     return RolloutOutput(
         prompt_ids=prompt_ids,
@@ -530,11 +558,16 @@ def _build_rollout_from_tensor_rows(
         return _empty_rollout()
     prompt_ids = prompts[start:end]
     lengths = response_lens[start:end].detach().cpu().tolist()
-    generated_rows = [row[: int(length)] for row, length in zip(generated[start:end].detach().cpu().tolist(), lengths, strict=True)]
+    generated_rows = [
+        row[: int(length)] for row, length in zip(generated[start:end].detach().cpu().tolist(), lengths, strict=True)
+    ]
     response_ids, truncated_finish_reasons = _truncate_generated(generated_rows, truncate_stop_token_ids)
     finish_reason = [finish_reasons[idx] or truncated_finish_reasons[idx - start] for idx in range(start, end)]
     logprob_rows_cpu = logprobs[start:end].detach().cpu().tolist()
-    logprob_rows = [torch.tensor(row[: len(response)], dtype=torch.float32) for row, response in zip(logprob_rows_cpu, response_ids, strict=True)]
+    logprob_rows = [
+        torch.tensor(row[: len(response)], dtype=torch.float32)
+        for row, response in zip(logprob_rows_cpu, response_ids, strict=True)
+    ]
     input_ids, attention_mask, response_mask, padded_logprobs = pad_rollout_rows(prompt_ids, response_ids, logprob_rows)
     return RolloutOutput(
         prompt_ids=prompt_ids,

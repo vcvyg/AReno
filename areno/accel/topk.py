@@ -21,7 +21,9 @@ class _TopKSoftmax(torch.autograd.Function):
     def backward(ctx, grad_idx: torch.Tensor, grad_weight: torch.Tensor) -> tuple[torch.Tensor, None, None]:
         del grad_idx
         logits, idx = ctx.saved_tensors
-        grad_logits = _extension().areno_topk_softmax_backward(grad_weight.contiguous(), logits.contiguous(), idx.contiguous(), ctx.renormalize)
+        grad_logits = _extension().areno_topk_softmax_backward(
+            grad_weight.contiguous(), logits.contiguous(), idx.contiguous(), ctx.renormalize
+        )
         return grad_logits, None, None
 
 

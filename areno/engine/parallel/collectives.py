@@ -20,15 +20,14 @@ divisible by `tp_size`, so the seqlen-axis collectives operate on dim=1.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 import contextvars
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 
 from areno.engine.parallel.context import get_tp_context
-
 
 _SEQUENCE_PARALLEL_ACTIVE = contextvars.ContextVar("areno_sequence_parallel_active", default=False)
 

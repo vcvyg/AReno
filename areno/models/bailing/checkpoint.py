@@ -28,7 +28,6 @@ from areno.engine.checkpoints.common import (
     TopLevelSpec,
 )
 
-
 # Bailing wraps the embedding under ``model.word_embeddings`` (not the more
 # common ``model.embed_tokens``); the LM head is tied by default in the HF
 # checkpoint and so is omitted from this spec.

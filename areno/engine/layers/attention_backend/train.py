@@ -19,8 +19,8 @@ from abc import ABC, abstractmethod
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 from flash_attn import flash_attn_func, flash_attn_varlen_func
+from torch import nn
 
 from areno.engine.layers.attention_backend.common import build_attention_call, expand_kv_heads, sdpa_window_size
 from areno.engine.runtime.metadata import TrainMeta
@@ -143,7 +143,9 @@ def _sdpa_train(
         k_flat = k.reshape(-1, k.shape[-2], k.shape[-1])
         v_flat = v.reshape(-1, v.shape[-2], v.shape[-1])
         for start, end in zip(cu[:-1], cu[1:], strict=True):
-            outs.append(_sdpa_sequence(q_flat[start:end], k_flat[start:end], v_flat[start:end], window_size, softmax_scale))
+            outs.append(
+                _sdpa_sequence(q_flat[start:end], k_flat[start:end], v_flat[start:end], window_size, softmax_scale)
+            )
         return torch.cat(outs, dim=0).view(q.shape)
     # Padded SDPA: expand KV heads for GQA and reshape to (B, H, S, D).
     k = expand_kv_heads(k, q.shape[-2])

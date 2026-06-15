@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import torch
 import torch.distributed as dist
 
 from areno.engine.optim.adamw_fp32_master import (
     _DEFAULT_BUCKET_NUMEL,
-    _MasterBucket,
-    _ParamRef,
-    _param_grad,
     AdamWFP32Master,
+    _MasterBucket,
+    _param_grad,
+    _ParamRef,
 )
 
 
@@ -131,7 +131,9 @@ class AdamW8bit(AdamWFP32Master):
                     "exp_avg_q": state.exp_avg_q.detach().clone() if state.exp_avg_q is not None else None,
                     "exp_avg_scale": state.exp_avg_scale.detach().clone() if state.exp_avg_scale is not None else None,
                     "exp_avg_sq_q": state.exp_avg_sq_q.detach().clone() if state.exp_avg_sq_q is not None else None,
-                    "exp_avg_sq_scale": state.exp_avg_sq_scale.detach().clone() if state.exp_avg_sq_scale is not None else None,
+                    "exp_avg_sq_scale": state.exp_avg_sq_scale.detach().clone()
+                    if state.exp_avg_sq_scale is not None
+                    else None,
                 }
                 for state in self._states
             ],
@@ -151,10 +153,24 @@ class AdamW8bit(AdamWFP32Master):
             exp_avg_scale = saved.get("exp_avg_scale")
             exp_avg_sq_q = saved.get("exp_avg_sq_q")
             exp_avg_sq_scale = saved.get("exp_avg_sq_scale")
-            state.exp_avg_q = None if exp_avg_q is None else exp_avg_q.detach().to(device=device, dtype=torch.uint8).view(-1).clone()
-            state.exp_avg_scale = None if exp_avg_scale is None else exp_avg_scale.detach().to(device=device, dtype=torch.float32).view(()).clone()
-            state.exp_avg_sq_q = None if exp_avg_sq_q is None else exp_avg_sq_q.detach().to(device=device, dtype=torch.uint8).view(-1).clone()
-            state.exp_avg_sq_scale = None if exp_avg_sq_scale is None else exp_avg_sq_scale.detach().to(device=device, dtype=torch.float32).view(()).clone()
+            state.exp_avg_q = (
+                None if exp_avg_q is None else exp_avg_q.detach().to(device=device, dtype=torch.uint8).view(-1).clone()
+            )
+            state.exp_avg_scale = (
+                None
+                if exp_avg_scale is None
+                else exp_avg_scale.detach().to(device=device, dtype=torch.float32).view(()).clone()
+            )
+            state.exp_avg_sq_q = (
+                None
+                if exp_avg_sq_q is None
+                else exp_avg_sq_q.detach().to(device=device, dtype=torch.uint8).view(-1).clone()
+            )
+            state.exp_avg_sq_scale = (
+                None
+                if exp_avg_sq_scale is None
+                else exp_avg_sq_scale.detach().to(device=device, dtype=torch.float32).view(()).clone()
+            )
 
     @torch.no_grad()
     def _ensure_bucket_state(self, bucket: _MasterBucket, state: _Adam8bitBucketState) -> None:
@@ -199,7 +215,9 @@ class AdamW8bit(AdamWFP32Master):
             if grad is None:
                 continue
             flat_grad = grad.detach().reshape(-1).narrow(0, ref.param_start, ref.numel)
-            self._step_param_ref_8bit(bucket, ref, flat_grad, exp_avg, exp_avg_sq, beta1, beta2, step_size, bias_correction2_sqrt)
+            self._step_param_ref_8bit(
+                bucket, ref, flat_grad, exp_avg, exp_avg_sq, beta1, beta2, step_size, bias_correction2_sqrt
+            )
             updated_refs.append(ref)
             if ref.param_start + ref.numel == ref.model_param.numel():
                 ref.model_param.grad = None

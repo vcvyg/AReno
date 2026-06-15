@@ -19,9 +19,7 @@ def resolve_model_ref(model_ref: str, cache: dict[str, str] | None = None) -> st
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
-        raise RuntimeError(
-            f"{model_ref!r} is not a local checkpoint path and huggingface_hub is unavailable"
-        ) from exc
+        raise RuntimeError(f"{model_ref!r} is not a local checkpoint path and huggingface_hub is unavailable") from exc
     resolved = snapshot_download(model_ref)
     if cache is not None:
         cache[model_ref] = resolved

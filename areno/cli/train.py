@@ -17,9 +17,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import click
+
 from areno.api.algorithms import get_algorithm
 from areno.api.defaults import DEFAULT_METRICS_LOG_DIR
-from areno.api.trainer_config import DPOTrainerConfig, PPOTrainerConfig, PolicyTrainerConfig, TrainerConfig
+from areno.api.trainer_config import DPOTrainerConfig, PolicyTrainerConfig, PPOTrainerConfig, TrainerConfig
 from areno.cli.model_refs import resolve_model_refs_for_config
 
 
@@ -245,9 +246,9 @@ def run(trainer_config: TrainerConfig):
 
     # Heavy dependencies are imported lazily so `python train.py --help`
     # does not pay the cost of importing torch/areno.
-    import areno.api
     from datasets import load_dataset, load_from_disk
 
+    import areno.api
     from areno.api.rewards import load_reward_fn
     from areno.api.trainer_factory import build_trainer
 
@@ -295,7 +296,9 @@ def _reward_fn_path_for_config(config: TrainerConfig) -> str | None:
 
 
 def _load_dataset_for_training(dataset_path: str, *, dataset_loader_fn: str | None, load_dataset, load_from_disk):
-    default_loader = lambda path: _load_dataset_from_path(path, load_dataset=load_dataset, load_from_disk=load_from_disk)
+    def default_loader(path):
+        return _load_dataset_from_path(path, load_dataset=load_dataset, load_from_disk=load_from_disk)
+
     if dataset_loader_fn is not None:
         loader_fn = _load_dataset_loader_fn(dataset_loader_fn)
         return loader_fn(
@@ -392,8 +395,8 @@ def _load_parquet_without_hf_metadata(data_files):
     # Some HF parquet exports carry feature metadata that older/newer datasets
     # versions fail to deserialize. Reading through pandas ignores that metadata
     # and preserves the actual columns (prompt/chosen/rejected/etc.).
-    from datasets import Dataset
     import pandas as pd
+    from datasets import Dataset
 
     files = data_files if isinstance(data_files, list) else [data_files]
     frames = [pd.read_parquet(path) for path in files]
@@ -410,7 +413,9 @@ def _select_train_split(dataset):
 
 
 def _directory_data_files(path: Path) -> list[str]:
-    return sorted(str(item) for item in path.iterdir() if item.is_file() and item.suffix.lower() in _SUPPORTED_DATASET_SUFFIXES)
+    return sorted(
+        str(item) for item in path.iterdir() if item.is_file() and item.suffix.lower() in _SUPPORTED_DATASET_SUFFIXES
+    )
 
 
 def _dataset_builder_for_suffix(suffix: str) -> str:
@@ -434,20 +439,30 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
 )
 @click.option("--algo", type=str, default="gspo", show_default=True, help="Training algorithm registered in areno.api.")
 @click.option("--ckpt", default=None, help="Actor model/tokenizer checkpoint path or Hugging Face repo ID.")
-@click.option("--dataset-path", default=None, help="Training dataset path, HF save_to_disk directory, or HF dataset ref.")
-@click.option("--dataset-loader-fn", default=None, help="Optional Python dataset loader function as file.py or file.py:function.")
+@click.option(
+    "--dataset-path", default=None, help="Training dataset path, HF save_to_disk directory, or HF dataset ref."
+)
+@click.option(
+    "--dataset-loader-fn", default=None, help="Optional Python dataset loader function as file.py or file.py:function."
+)
 @click.option("--reward-fn-path", default=None, help="Python file defining reward_fn(record).")
-@click.option("--ref-ckpt", default=None, help="Optional PPO/DPO reference model checkpoint path or Hugging Face repo ID.")
+@click.option(
+    "--ref-ckpt", default=None, help="Optional PPO/DPO reference model checkpoint path or Hugging Face repo ID."
+)
 @click.option("--reward-ckpt", default=None, help="Optional PPO reward model checkpoint path or Hugging Face repo ID.")
 @click.option("--critic-ckpt", default=None, help="Optional PPO critic model checkpoint path or Hugging Face repo ID.")
 @click.option("--save-path", default=None, help="Optional checkpoint output directory.")
 @click.option("--save-interval", type=int, default=100, show_default=True, help="Save checkpoint every N train steps.")
-@click.option("--metrics-log-dir", default=DEFAULT_METRICS_LOG_DIR, show_default=True, help="TensorBoard metrics log directory.")
+@click.option(
+    "--metrics-log-dir", default=DEFAULT_METRICS_LOG_DIR, show_default=True, help="TensorBoard metrics log directory."
+)
 @click.option("--epochs", type=int, default=10, show_default=True, help="Number of dataset epochs to train.")
 @click.option("--tp-size", type=int, default=4, show_default=True, help="Tensor parallel size for the backend.")
 @click.option("--world-size", type=int, default=8, show_default=True, help="Total device count for the backend.")
 @click.option("--batch-size", type=int, default=32, show_default=True, help="Prompt/pair batch size.")
-@click.option("--n-samples", type=int, default=8, show_default=True, help="Rollout samples per prompt for RL algorithms.")
+@click.option(
+    "--n-samples", type=int, default=8, show_default=True, help="Rollout samples per prompt for RL algorithms."
+)
 @click.option("--mini-bs", type=int, default=16, show_default=True, help="Backend training microbatch size.")
 @click.option(
     "--gradient-accumulation-steps",
@@ -456,7 +471,13 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
     help="Optimizer step interval in microbatches; defaults to accumulating all mini-batches in one train call.",
 )
 @click.option("--max-prompt-tokens", type=int, default=1024, show_default=True, help="Maximum tokenized prompt length.")
-@click.option("--max-new-tokens", type=int, default=3071, show_default=True, help="Maximum generated or supervised response tokens.")
+@click.option(
+    "--max-new-tokens",
+    type=int,
+    default=3071,
+    show_default=True,
+    help="Maximum generated or supervised response tokens.",
+)
 @click.option("--temperature", type=float, default=1.0, show_default=True, help="Rollout sampling temperature.")
 @click.option("--top-k", type=int, default=-1, show_default=True, help="Rollout top-k; -1 disables top-k filtering.")
 @click.option("--top-p", type=float, default=1.0, show_default=True, help="Rollout top-p.")
@@ -489,18 +510,30 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
 )
 @click.option("--eager-decode", is_flag=True, help="Disable decode CUDA graph and run rollout decode eagerly.")
 @click.option("--agent-fn", default=None, help="Python file defining async run_agent(ctx, batch) for agentic rollout.")
-@click.option("--agent-timeout-s", type=float, default=300.0, show_default=True, help="Agentic rollout proxy request timeout.")
+@click.option(
+    "--agent-timeout-s", type=float, default=300.0, show_default=True, help="Agentic rollout proxy request timeout."
+)
 @click.option("--train-tool-results", is_flag=True, help="Include tool-result spans in agentic policy loss.")
-@click.option("--gspo-clip-eps", type=float, default=3.0e-4, show_default=True, help="GSPO sequence-ratio clipping epsilon.")
+@click.option(
+    "--gspo-clip-eps", type=float, default=3.0e-4, show_default=True, help="GSPO sequence-ratio clipping epsilon."
+)
 @click.option("--grpo-clip-eps", type=float, default=0.2, show_default=True, help="GRPO token-ratio clipping epsilon.")
 @click.option("--dpo-beta", type=float, default=0.1, show_default=True, help="DPO preference margin temperature.")
-@click.option("--critic-warmup-steps", type=int, default=20, show_default=True, help="PPO critic-only warmup steps before actor updates.")
+@click.option(
+    "--critic-warmup-steps",
+    type=int,
+    default=20,
+    show_default=True,
+    help="PPO critic-only warmup steps before actor updates.",
+)
 @click.option("--critic-lr", type=float, default=1.0e-5, show_default=True, help="PPO critic optimizer learning rate.")
 @click.option("--use-kl-loss/--no-use-kl-loss", default=True, show_default=True, help="Enable PPO actor KL loss.")
 @click.option("--kl-loss-coef", type=float, default=0.001, show_default=True, help="PPO actor KL loss coefficient.")
 @click.option("--kl-loss-type", default="low_var_kl", show_default=True, help="PPO actor KL loss type.")
 @click.option("--clip-eps", type=float, default=0.2, show_default=True, help="PPO policy clipping epsilon.")
-@click.option("--clip-ratio-c", type=float, default=3.0, show_default=True, help="PPO lower policy clipping bound multiplier.")
+@click.option(
+    "--clip-ratio-c", type=float, default=3.0, show_default=True, help="PPO lower policy clipping bound multiplier."
+)
 @click.option("--value-clip-eps", type=float, default=0.5, show_default=True, help="PPO value clipping epsilon.")
 @click.option("--value-loss-coef", type=float, default=0.5, show_default=True, help="PPO value loss coefficient.")
 @click.option("--gamma", type=float, default=1.0, show_default=True, help="PPO GAE discount.")

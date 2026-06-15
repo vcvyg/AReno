@@ -31,9 +31,15 @@ from typing import Any
 import torch
 from torch import nn
 
-from areno.accel import areno_grouped_linear, areno_moe_topk_permute, areno_moe_unpermute, areno_topk_softmax
+from areno.accel import (
+    areno_grouped_linear,
+    areno_moe_topk_permute,
+    areno_moe_unpermute,
+    areno_optional_scale_rmsnorm,
+    areno_topk_softmax,
+)
+from areno.accel.ops import FusedMoeConfig, areno_fused_experts, areno_gelu_tanh_and_mul, log_once
 from areno.engine.checkpoints.common import load_checkpoint_weights, save_checkpoint_weights
-from areno.models.gemma4.checkpoint import checkpoint_spec
 from areno.engine.config import ModelConfig, _parse_dtype
 from areno.engine.layers.attention_backend.infer import FlashAttnInferBackend, build_infer_attention_backend
 from areno.engine.layers.attention_backend.train import build_train_attention_backend
@@ -47,13 +53,12 @@ from areno.engine.layers.linear import (
 from areno.engine.layers.norm import RMSNorm
 from areno.engine.layers.rotary import Gemma4RotaryEmbedding
 from areno.engine.layers.vocab import VocabParallelEmbedding, VocabParallelLMHead
-from areno.accel.ops import FusedMoeConfig, areno_gelu_tanh_and_mul, areno_fused_experts, log_once
-from areno.models.base import CausalLMOutput, ModelAdapter
-from areno.accel import areno_optional_scale_rmsnorm
 from areno.engine.parallel.collectives import all_reduce, scatter_to_sequence_parallel_region, sequence_parallel_region
 from areno.engine.parallel.context import get_tp_context
 from areno.engine.runtime.metadata import InferMeta, TrainMeta
 from areno.engine.runtime.recompute import checkpoint_layer
+from areno.models.base import CausalLMOutput, ModelAdapter
+from areno.models.gemma4.checkpoint import checkpoint_spec
 
 
 class Gemma4RMSNorm(nn.Module):
@@ -83,7 +88,9 @@ class Gemma4ReplicatedLinear(nn.Module):
     avoid all-gathers.
     """
 
-    def __init__(self, in_features: int, out_features: int, *, sequence_parallel: bool, dtype: torch.dtype | None = None):
+    def __init__(
+        self, in_features: int, out_features: int, *, sequence_parallel: bool, dtype: torch.dtype | None = None
+    ):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
         mark_tensor_parallel_parameter(self.weight, False, sequence_parallel=sequence_parallel, tp_grad_allreduce=True)
@@ -128,7 +135,9 @@ class Gemma4Router(nn.Module):
         self.norm = Gemma4RMSNorm(config.hidden_size, config.rms_norm_eps, with_scale=False)
         self.scale = nn.Parameter(torch.ones(config.hidden_size, dtype=torch.float32))
         mark_tensor_parallel_parameter(self.scale, False, sequence_parallel=False, tp_grad_allreduce=True)
-        self.proj = Gemma4ReplicatedLinear(config.hidden_size, int(config.num_experts or 0), sequence_parallel=False, dtype=config.dtype)
+        self.proj = Gemma4ReplicatedLinear(
+            config.hidden_size, int(config.num_experts or 0), sequence_parallel=False, dtype=config.dtype
+        )
         self.register_buffer("root_size", torch.tensor(config.hidden_size**-0.5), persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -172,7 +181,9 @@ class Gemma4MoeExperts(nn.Module):
         if x.shape[0] == 0:
             return all_reduce(flat.new_zeros(flat.shape))
         hidden = _areno_grouped_linear_no_compile(x.contiguous(), self.gate_up_weight, tokens_per_expert)
-        hidden = (_areno_gelu_tanh_and_mul_no_compile(hidden) * route_weight.unsqueeze(-1).to(dtype=hidden.dtype)).contiguous()
+        hidden = (
+            _areno_gelu_tanh_and_mul_no_compile(hidden) * route_weight.unsqueeze(-1).to(dtype=hidden.dtype)
+        ).contiguous()
         out = _areno_grouped_linear_no_compile(hidden, self.down_weight, tokens_per_expert)
         out = _areno_moe_unpermute_no_compile(out, token_idx, flat.shape)
         return all_reduce(out)
@@ -183,7 +194,9 @@ class Gemma4MoeExperts(nn.Module):
         return local_idx, topk_weight * local_mask.to(dtype=topk_weight.dtype)
 
     @torch.no_grad()
-    def copy_expert(self, expert_id: int, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor, rank: int, world_size: int) -> None:
+    def copy_expert(
+        self, expert_id: int, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor, rank: int, world_size: int
+    ) -> None:
         del rank, world_size
         if expert_id < self.local_expert_start or expert_id >= self.local_expert_end:
             return
@@ -235,7 +248,9 @@ class Gemma4MoeMLP(nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
         batch, seqlen, hidden = hidden_states.shape
         flat = hidden_states.reshape(-1, hidden)
-        topk_idx, topk_weight = _areno_topk_softmax_no_compile(router_logits.reshape(-1, self.num_experts), self.top_k, self.norm_topk_prob)
+        topk_idx, topk_weight = _areno_topk_softmax_no_compile(
+            router_logits.reshape(-1, self.num_experts), self.top_k, self.norm_topk_prob
+        )
         topk_weight = topk_weight * self.per_expert_scale[topk_idx].to(dtype=topk_weight.dtype)
         if self.training:
             out = self.experts(flat, topk_idx.to(torch.long), topk_weight)
@@ -371,8 +386,14 @@ class Gemma4Attention(nn.Module):
             # Skip K/V computation entirely; only rotate Q using a zero K of the
             # right shape so the rope op still produces a valid Q tensor.
             if shared_kv is None:
-                raise RuntimeError(f"Gemma4 layer {self.layer_idx} requires shared KV from layer {self.kv_shared_layer_index}")
-            q, _ = self.rope(q, torch.zeros(batch, seqlen, self.local_kv_heads, self.head_dim, device=q.device, dtype=q.dtype), position_ids)
+                raise RuntimeError(
+                    f"Gemma4 layer {self.layer_idx} requires shared KV from layer {self.kv_shared_layer_index}"
+                )
+            q, _ = self.rope(
+                q,
+                torch.zeros(batch, seqlen, self.local_kv_heads, self.head_dim, device=q.device, dtype=q.dtype),
+                position_ids,
+            )
             k, v = shared_kv
         else:
             k = self.k_norm(k.view(batch, seqlen, self.local_kv_heads, self.head_dim))
@@ -387,7 +408,9 @@ class Gemma4Attention(nn.Module):
             return self.forward_infer(q, k, v, infer_meta), kv_for_share
         return self.forward_train(q, k, v, train_meta), kv_for_share
 
-    def forward_train(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, train_meta: TrainMeta | None) -> torch.Tensor:
+    def forward_train(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, train_meta: TrainMeta | None
+    ) -> torch.Tensor:
         # Window size and softmax_scale are passed through so the backend can
         # honour sliding attention and the Gemma-specific scale of 1.0.
         out = self.train_backend(q, k, v, train_meta, self.window_size, self.softmax_scale)
@@ -439,7 +462,9 @@ class Gemma4DecoderLayer(nn.Module):
         # Double-wide MLP only kicks in for KV-shared tail layers (compensates
         # for the missing K/V capacity by widening the FF block).
         first_shared = config.num_hidden_layers - config.num_kv_shared_layers
-        use_double_wide_mlp = config.use_double_wide_mlp and config.num_kv_shared_layers > 0 and layer_idx >= first_shared
+        use_double_wide_mlp = (
+            config.use_double_wide_mlp and config.num_kv_shared_layers > 0 and layer_idx >= first_shared
+        )
         self.mlp = Gemma4MLP(config, use_double_wide_mlp)
         self.router = Gemma4Router(config) if config.enable_moe_block else None
         self.moe = Gemma4MoeMLP(config) if config.enable_moe_block else None
@@ -447,9 +472,15 @@ class Gemma4DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.pre_feedforward_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_feedforward_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.pre_feedforward_layernorm_2 = RMSNorm(config.hidden_size, config.rms_norm_eps) if config.enable_moe_block else None
-        self.post_feedforward_layernorm_1 = RMSNorm(config.hidden_size, config.rms_norm_eps) if config.enable_moe_block else None
-        self.post_feedforward_layernorm_2 = RMSNorm(config.hidden_size, config.rms_norm_eps) if config.enable_moe_block else None
+        self.pre_feedforward_layernorm_2 = (
+            RMSNorm(config.hidden_size, config.rms_norm_eps) if config.enable_moe_block else None
+        )
+        self.post_feedforward_layernorm_1 = (
+            RMSNorm(config.hidden_size, config.rms_norm_eps) if config.enable_moe_block else None
+        )
+        self.post_feedforward_layernorm_2 = (
+            RMSNorm(config.hidden_size, config.rms_norm_eps) if config.enable_moe_block else None
+        )
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
         if self.hidden_size_per_layer_input > 0:
             # PLE modules: gate projects hidden -> PLE width; projection brings
@@ -492,12 +523,19 @@ class Gemma4DecoderLayer(nn.Module):
         residual = hidden_states
         dense_input = self.pre_feedforward_layernorm(hidden_states)
         if self.moe is not None:
-            if self.router is None or self.pre_feedforward_layernorm_2 is None or self.post_feedforward_layernorm_1 is None or self.post_feedforward_layernorm_2 is None:
+            if (
+                self.router is None
+                or self.pre_feedforward_layernorm_2 is None
+                or self.post_feedforward_layernorm_1 is None
+                or self.post_feedforward_layernorm_2 is None
+            ):
                 raise RuntimeError("Gemma4 MoE layer is missing router or MoE norms")
             dense_hidden = self.mlp(dense_input)
             router_logits = self.router(residual)
             moe_hidden = self.moe(self.pre_feedforward_layernorm_2(residual), router_logits)
-            hidden_states = self.post_feedforward_layernorm_1(dense_hidden) + self.post_feedforward_layernorm_2(moe_hidden)
+            hidden_states = self.post_feedforward_layernorm_1(dense_hidden) + self.post_feedforward_layernorm_2(
+                moe_hidden
+            )
         else:
             hidden_states = self.mlp(dense_input)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
@@ -506,7 +544,11 @@ class Gemma4DecoderLayer(nn.Module):
             # PLE injection: concatenate the gated hidden with the per-layer
             # signal and run them through gelu_tanh + mul before projecting
             # back to hidden_size and normalizing.
-            if self.per_layer_input_gate is None or self.per_layer_projection is None or self.post_per_layer_input_norm is None:
+            if (
+                self.per_layer_input_gate is None
+                or self.per_layer_projection is None
+                or self.post_per_layer_input_norm is None
+            ):
                 raise RuntimeError("Gemma4 PLE tensors were provided but layer PLE modules are missing")
             gate_input = self.per_layer_input_gate(hidden_states)
             per_layer_contribution = self.per_layer_projection(
@@ -606,7 +648,9 @@ class Gemma4ForCausalLM(nn.Module):
                         infer_meta=infer_meta,
                     )
                 else:
-                    hidden_states, kv_for_share = layer(hidden_states, position_ids, per_layer_input, shared_kv, train_meta, infer_meta)
+                    hidden_states, kv_for_share = layer(
+                        hidden_states, position_ids, per_layer_input, shared_kv, train_meta, infer_meta
+                    )
                 if kv_for_share is not None:
                     shared_kv_by_layer[layer_idx] = kv_for_share
             hidden_states = self.norm(hidden_states)
@@ -630,12 +674,18 @@ class Gemma4ForCausalLM(nn.Module):
         return embeds.reshape(*input_ids.shape, self.config.num_hidden_layers, self.hidden_size_per_layer_input)
 
     @torch._dynamo.disable
-    def project_per_layer_inputs(self, hidden_states: torch.Tensor, per_layer_inputs: torch.Tensor | None) -> torch.Tensor | None:
+    def project_per_layer_inputs(
+        self, hidden_states: torch.Tensor, per_layer_inputs: torch.Tensor | None
+    ) -> torch.Tensor | None:
         """Combine projected hidden states with PLE embeddings (variance-preserving)."""
         if self.per_layer_model_projection is None:
             return None
-        projected = self.per_layer_model_projection(hidden_states) * self.per_layer_projection_scale.to(hidden_states.device)
-        projected = projected.reshape(*hidden_states.shape[:-1], self.config.num_hidden_layers, self.hidden_size_per_layer_input)
+        projected = self.per_layer_model_projection(hidden_states) * self.per_layer_projection_scale.to(
+            hidden_states.device
+        )
+        projected = projected.reshape(
+            *hidden_states.shape[:-1], self.config.num_hidden_layers, self.hidden_size_per_layer_input
+        )
         if self.per_layer_projection_norm is None:
             raise RuntimeError("Gemma4 PLE projection norm is missing")
         projected = self.per_layer_projection_norm(projected)
@@ -685,7 +735,9 @@ class Gemma4ForCausalLM(nn.Module):
         del tp_group, dp_group
         return None
 
-    def allocate_kv_caches(self, num_blocks: int, block_size: int, device: torch.device) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    def allocate_kv_caches(
+        self, num_blocks: int, block_size: int, device: torch.device
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Allocate per-layer KV caches, deduplicating slots for KV-shared layers."""
         caches = []
         for layer in self.layers:
@@ -694,8 +746,22 @@ class Gemma4ForCausalLM(nn.Module):
                 # KV-shared layer reuses the buffer of the matching source layer.
                 caches.append(caches[attention.kv_shared_layer_index])
                 continue
-            k_cache = torch.empty(num_blocks, block_size, attention.local_kv_heads, attention.head_dim, device=device, dtype=self.config.dtype)
-            v_cache = torch.empty(num_blocks, block_size, attention.local_kv_heads, attention.head_dim, device=device, dtype=self.config.dtype)
+            k_cache = torch.empty(
+                num_blocks,
+                block_size,
+                attention.local_kv_heads,
+                attention.head_dim,
+                device=device,
+                dtype=self.config.dtype,
+            )
+            v_cache = torch.empty(
+                num_blocks,
+                block_size,
+                attention.local_kv_heads,
+                attention.head_dim,
+                device=device,
+                dtype=self.config.dtype,
+            )
             caches.append((k_cache, v_cache))
         return caches
 
@@ -782,7 +848,9 @@ class Gemma4Adapter(ModelAdapter):
         # swa_head_dim does the same for sliding-attention layers (handled in
         # _attention_head_dim).
         head_dim = int(cfg.get("global_head_dim") or base_head_dim)
-        kv_heads = int(cfg.get("num_global_key_value_heads") or cfg.get("num_key_value_heads", cfg["num_attention_heads"]))
+        kv_heads = int(
+            cfg.get("num_global_key_value_heads") or cfg.get("num_key_value_heads", cfg["num_attention_heads"])
+        )
         enable_moe_block = bool(cfg.get("enable_moe_block", False))
         top_k_experts = cfg.get("top_k_experts")
         if top_k_experts is None:
@@ -804,14 +872,18 @@ class Gemma4Adapter(ModelAdapter):
             qkv_bias=bool(cfg.get("attention_bias", False)),
             qk_norm=True,
             v_norm=True,
-            dtype=_parse_dtype(hf_config.get("torch_dtype") or cfg.get("torch_dtype") or hf_config.get("dtype") or cfg.get("dtype")),
+            dtype=_parse_dtype(
+                hf_config.get("torch_dtype") or cfg.get("torch_dtype") or hf_config.get("dtype") or cfg.get("dtype")
+            ),
             hidden_act=str(cfg.get("hidden_activation", cfg.get("hidden_act", "gelu_pytorch_tanh"))),
             layer_types=layer_types,
             sliding_window=cfg.get("sliding_window"),
             # Sliding-attention layers may carry a different head_dim/kv-head
             # count from the full-attention layers.
             swa_head_dim=int(cfg.get("swa_head_dim") or base_head_dim),
-            swa_num_key_value_heads=int(cfg.get("swa_num_key_value_heads") or cfg.get("num_key_value_heads", cfg["num_attention_heads"])),
+            swa_num_key_value_heads=int(
+                cfg.get("swa_num_key_value_heads") or cfg.get("num_key_value_heads", cfg["num_attention_heads"])
+            ),
             rope_parameters=cfg.get("rope_parameters"),
             attention_k_eq_v=bool(cfg.get("attention_k_eq_v", False)),
             num_kv_shared_layers=int(cfg.get("num_kv_shared_layers") or 0),
@@ -911,7 +983,9 @@ def _reject_unsupported_gemma4(cfg: dict[str, Any]) -> None:
     if cfg.get("swa_head_dim") is not None and cfg.get("global_head_dim") is not None:
         raise ValueError("Gemma4 configs should use either global_head_dim or swa_head_dim, not both")
     if cfg.get("swa_num_key_value_heads") is not None and cfg.get("num_global_key_value_heads") is not None:
-        raise ValueError("Gemma4 configs should use either num_global_key_value_heads or swa_num_key_value_heads, not both")
+        raise ValueError(
+            "Gemma4 configs should use either num_global_key_value_heads or swa_num_key_value_heads, not both"
+        )
 
 
 def _validate_gemma4_config(config: ModelConfig) -> None:
@@ -938,7 +1012,9 @@ def _validate_gemma4_config(config: ModelConfig) -> None:
             raise ValueError("Gemma4 num_attention_heads must divide tensor parallel world size")
         kv_heads = _attention_kv_heads(config, layer_type)
         if kv_heads % ctx.world_size != 0 and ctx.world_size % kv_heads != 0:
-            raise ValueError(f"Gemma4 {layer_type} num_key_value_heads must either divide or be replicated across tensor parallel world size")
+            raise ValueError(
+                f"Gemma4 {layer_type} num_key_value_heads must either divide or be replicated across tensor parallel world size"
+            )
 
 
 @torch._dynamo.disable
@@ -968,7 +1044,9 @@ def _areno_linear_no_compile(x: torch.Tensor, weight: torch.Tensor) -> torch.Ten
 
 
 @torch._dynamo.disable
-def _areno_topk_softmax_no_compile(logits: torch.Tensor, top_k: int, renormalize: bool) -> tuple[torch.Tensor, torch.Tensor]:
+def _areno_topk_softmax_no_compile(
+    logits: torch.Tensor, top_k: int, renormalize: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
     return areno_topk_softmax(logits, top_k, renormalize)
 
 
@@ -984,12 +1062,16 @@ def _areno_moe_topk_permute_no_compile(
 
 
 @torch._dynamo.disable
-def _areno_moe_unpermute_no_compile(expert_out: torch.Tensor, token_idx: torch.Tensor, restore_shape: tuple[int, int]) -> torch.Tensor:
+def _areno_moe_unpermute_no_compile(
+    expert_out: torch.Tensor, token_idx: torch.Tensor, restore_shape: tuple[int, int]
+) -> torch.Tensor:
     return areno_moe_unpermute(expert_out, token_idx, restore_shape)
 
 
 @torch._dynamo.disable
-def _areno_grouped_linear_no_compile(x: torch.Tensor, weight: torch.Tensor, tokens_per_expert: torch.Tensor) -> torch.Tensor:
+def _areno_grouped_linear_no_compile(
+    x: torch.Tensor, weight: torch.Tensor, tokens_per_expert: torch.Tensor
+) -> torch.Tensor:
     return areno_grouped_linear(x, weight, tokens_per_expert)
 
 

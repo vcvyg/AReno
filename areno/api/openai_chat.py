@@ -94,7 +94,9 @@ def build_chat_completion_response(
         display_text = _decode(tokenizer, token_ids, skip_special_tokens=True)
         display_text, stop_hit = _trim_stop_strings(display_text, stop_strings)
         completion_tokens += len(token_ids)
-        tool_calls = parsed_tool_calls[index] if parsed_tool_calls is not None and index < len(parsed_tool_calls) else []
+        tool_calls = (
+            parsed_tool_calls[index] if parsed_tool_calls is not None and index < len(parsed_tool_calls) else []
+        )
         if not tool_calls and tools and tool_call_parser is not None:
             tool_calls = tool_call_parser.parse(raw_text, tools, tool_choice).tool_calls
         finish_reason = "stop" if stop_hit or finish_reasons[index] == "stop" else "length"

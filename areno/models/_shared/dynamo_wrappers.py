@@ -37,7 +37,9 @@ def _areno_depthwise_causal_conv1d_silu_no_compile(x: torch.Tensor, weight: torc
 
 
 @torch._dynamo.disable
-def _areno_packed_depthwise_causal_conv1d_silu_no_compile(x: torch.Tensor, weight: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+def _areno_packed_depthwise_causal_conv1d_silu_no_compile(
+    x: torch.Tensor, weight: torch.Tensor, cu_seqlens: torch.Tensor
+) -> torch.Tensor:
     return areno_packed_depthwise_causal_conv1d_silu(x, weight, cu_seqlens)
 
 
@@ -113,7 +115,9 @@ def _areno_softplus_no_compile(x: torch.Tensor) -> torch.Tensor:
 
 
 @torch._dynamo.disable
-def _areno_rmsnorm_silu_gate_no_compile(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _areno_rmsnorm_silu_gate_no_compile(
+    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
     return areno_rmsnorm_silu_gate(x, gate, weight, eps)
 
 

@@ -7,6 +7,7 @@ always coerced to ``float32`` so the CUDA path matches the reference layout.
 The ``*_decode`` entry point handles the single-token autoregressive case
 using a separately maintained history cache.
 """
+
 import torch
 
 from areno.accel._extension import extension as _extension
@@ -98,7 +99,9 @@ def areno_depthwise_causal_conv1d_silu(x: torch.Tensor, weight: torch.Tensor) ->
 
 
 @torch._dynamo.disable
-def areno_packed_depthwise_causal_conv1d_silu(x: torch.Tensor, weight: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+def areno_packed_depthwise_causal_conv1d_silu(
+    x: torch.Tensor, weight: torch.Tensor, cu_seqlens: torch.Tensor
+) -> torch.Tensor:
     """Apply depthwise causal conv1d followed by SiLU to packed (1, tokens, channels) tensors."""
     if not x.is_cuda or not weight.is_cuda or not cu_seqlens.is_cuda:
         raise RuntimeError("areno_packed_depthwise_causal_conv1d_silu requires CUDA tensors")
@@ -118,7 +121,9 @@ def areno_packed_depthwise_causal_conv1d_silu(x: torch.Tensor, weight: torch.Ten
 
 
 @torch._dynamo.disable
-def areno_depthwise_causal_conv1d_silu_decode(current: torch.Tensor, history: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def areno_depthwise_causal_conv1d_silu_decode(
+    current: torch.Tensor, history: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
     """Apply one-token depthwise causal conv1d followed by SiLU for decode.
 
     ``current`` is the new token activations with shape ``(rows, channels)``

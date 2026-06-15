@@ -9,10 +9,11 @@ one scalar score, which keeps prompt and agentic demos on the same contract.
 from __future__ import annotations
 
 import importlib.util
-import numpy as np
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
+import numpy as np
 from pydantic import BaseModel, Field
 
 
@@ -45,6 +46,7 @@ class RewardRecord(BaseModel):
     loss_mask: list[bool] = Field(default_factory=list)
     source_record: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
 
 def compute_group_advantages(rewards: list[float], eps: float = 1e-8) -> list[float]:
     """Normalize rewards within one prompt group for GRPO/GSPO training.

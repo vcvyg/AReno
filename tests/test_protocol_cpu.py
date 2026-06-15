@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import unittest
 import importlib.util
 import sys
 import threading
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -109,6 +109,7 @@ class TPClusterResourceTest(unittest.TestCase):
         self.assertTrue(pending.event.is_set())
         self.assertEqual(pending.results[0], "dp0")
         self.assertEqual(pending.results[2], "dp1")
+
 
 if __name__ == "__main__":
     unittest.main()

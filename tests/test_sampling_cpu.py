@@ -4,8 +4,7 @@ import unittest
 
 import torch
 
-from areno.engine.data import SamplingParams
-from areno.engine.data import sampling
+from areno.engine.data import SamplingParams, sampling
 
 
 class SamplingTest(unittest.TestCase):

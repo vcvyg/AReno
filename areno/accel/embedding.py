@@ -5,6 +5,7 @@ vocabulary ``[vocab_start, vocab_end)``. The kernel gathers rows for ids that
 fall inside that range and writes zeros for out-of-range ids so the subsequent
 all-reduce reconstructs the full embedding.
 """
+
 import torch
 
 from areno.accel._extension import extension as _extension
@@ -15,7 +16,9 @@ class _VocabEmbedding(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_ids: torch.Tensor, weight: torch.Tensor, vocab_start: int, vocab_end: int) -> torch.Tensor:
-        out = _extension().areno_vocab_embedding_forward(input_ids.contiguous(), weight.contiguous(), int(vocab_start), int(vocab_end))
+        out = _extension().areno_vocab_embedding_forward(
+            input_ids.contiguous(), weight.contiguous(), int(vocab_start), int(vocab_end)
+        )
         ctx.save_for_backward(input_ids, weight)
         ctx.vocab_start = int(vocab_start)
         ctx.vocab_end = int(vocab_end)
@@ -35,7 +38,9 @@ class _VocabEmbedding(torch.autograd.Function):
 
 
 @torch._dynamo.disable
-def areno_vocab_embedding(input_ids: torch.Tensor, weight: torch.Tensor, vocab_start: int, vocab_end: int) -> torch.Tensor:
+def areno_vocab_embedding(
+    input_ids: torch.Tensor, weight: torch.Tensor, vocab_start: int, vocab_end: int
+) -> torch.Tensor:
     """Gather rank-local vocab embeddings and zero out non-local token ids.
 
     ``input_ids`` must be int64 on CUDA. ``weight`` is the local shard with

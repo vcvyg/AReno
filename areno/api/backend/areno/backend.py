@@ -24,12 +24,11 @@ from threading import Lock
 
 import torch
 
-from areno.api.context import Context
+from areno.api.backend.base import Backend, register_backend
 from areno.api.config import ArenoConfig
+from areno.api.context import Context
 from areno.api.models import BackendType, RolloutResult, RolloutSequence, SamplingParams, TrainSequence
 from areno.api.roles import ModelRole
-from areno.api.backend.base import Backend, register_backend
-
 
 logger = logging.getLogger(__name__)
 _SYS_PATH_LOCK = Lock()
@@ -45,7 +44,9 @@ def _rollout_options(ctx: Context, sampling_params: SamplingParams):
     suppress_candidates = set(_explicit_suppress_token_ids(ctx.tokenizer))
     if not sampling_params.ignore_eos:
         suppress_candidates.update(int(token_id) for token_id in getattr(ctx.tokenizer, "all_special_ids", ()) or ())
-    suppress_token_ids = tuple(sorted(token_id for token_id in suppress_candidates if token_id not in {*eos_token_ids, *stop_token_ids}))
+    suppress_token_ids = tuple(
+        sorted(token_id for token_id in suppress_candidates if token_id not in {*eos_token_ids, *stop_token_ids})
+    )
     cfg = ctx.custom_config
     if cfg is None:
         cfg = ArenoConfig()
@@ -448,7 +449,9 @@ def _make_train_pack(seqs: list[TrainSequence]) -> dict[str, torch.Tensor]:
     has_ref_logprobs = any(bool(seq.ref_logprobs) for seq in seqs)
     returns = pad_rows([seq.returns for seq in seqs], dtype=torch.float32, width=max_len) if has_returns else None
     values = pad_rows([seq.values for seq in seqs], dtype=torch.float32, width=max_len) if has_values else None
-    ref_logprobs = pad_rows([seq.ref_logprobs for seq in seqs], dtype=torch.float32, width=max_len) if has_ref_logprobs else None
+    ref_logprobs = (
+        pad_rows([seq.ref_logprobs for seq in seqs], dtype=torch.float32, width=max_len) if has_ref_logprobs else None
+    )
 
     pack = {
         "input_ids": input_ids,
@@ -495,7 +498,6 @@ def _is_rollout_policy_metric(key: str) -> bool:
     # These metrics describe the rollout-vs-train policy gap; the value on the
     # first microbatch is most representative because subsequent microbatches
     # already see updated weights once the engine fires gradient steps.
-    return (
-        key in {"ratio_mean", "ratio_std", "rollout_logprobs_mean", "train_logprobs_mean"}
-        or key.startswith("logp_diff")
+    return key in {"ratio_mean", "ratio_std", "rollout_logprobs_mean", "train_logprobs_mean"} or key.startswith(
+        "logp_diff"
     )

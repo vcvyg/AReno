@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import torch
 
-from areno.engine.runtime.metadata import InferMeta
 from areno.engine.data import RolloutOutput
 from areno.engine.runtime.common import ceil_div, pad_rollout_rows
+from areno.engine.runtime.metadata import InferMeta
 
 
 class InferenceBatchState:
@@ -134,15 +134,19 @@ class InferenceBatchState:
                 if not self._free_blocks:
                     if not input_ids:
                         raise RuntimeError("paged KV cache exhausted during prefill")
-                    return None if not input_ids else self._prefill_payload(
-                        input_ids,
-                        position_ids,
-                        cu_seqlens,
-                        sample_indices,
-                        block_table,
-                        cache_block_ids,
-                        cache_block_offsets,
-                        active_ids,
+                    return (
+                        None
+                        if not input_ids
+                        else self._prefill_payload(
+                            input_ids,
+                            position_ids,
+                            cu_seqlens,
+                            sample_indices,
+                            block_table,
+                            cache_block_ids,
+                            cache_block_offsets,
+                            active_ids,
+                        )
                     )
                 blocks.append(self._free_blocks.pop(0))
             chunk = prompt[cursor : cursor + chunk_len]
@@ -222,7 +226,9 @@ class InferenceBatchState:
 
     def to_rollout(self) -> RolloutOutput:
         """Materialize Python rollout state into padded tensors for the API."""
-        input_ids, attention_mask, response_mask, logprobs = pad_rollout_rows(self.prompts, self.generated, self.logprobs)
+        input_ids, attention_mask, response_mask, logprobs = pad_rollout_rows(
+            self.prompts, self.generated, self.logprobs
+        )
         reasons = [reason or "unknown" for reason in self.finish_reason]
         return RolloutOutput(
             prompt_ids=self.prompts,

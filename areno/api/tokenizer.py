@@ -11,8 +11,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from areno.engine.data.tokenizer import load_tokenizer
-
 
 def eos_token_ids(model_path: str | Path, tokenizer) -> tuple[int, ...]:
     """Collect EOS ids from tokenizer and HF config.

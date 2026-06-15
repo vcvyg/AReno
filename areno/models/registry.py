@@ -19,7 +19,6 @@ from areno.engine.config import ModelConfig
 from areno.engine.parallel.context import get_tp_context
 from areno.models.base import ModelAdapter
 
-
 # Registered adapters keyed by their declared ``name`` field.
 _ADAPTERS: dict[str, ModelAdapter] = {}
 # Tracks whether the areno.models plugin pack has been imported yet so
@@ -92,7 +91,9 @@ def load_model_weights(model, config: ModelConfig, model_path: str | Path) -> No
             os.environ["ARENO_CKPT_PROGRESS"] = old_progress
 
 
-def save_model_weights(model, config: ModelConfig, output_path: str | Path, source_path: str | Path | None) -> str | None:
+def save_model_weights(
+    model, config: ModelConfig, output_path: str | Path, source_path: str | Path | None
+) -> str | None:
     """Save weights via the model's adapter, unwrapping any torch.compile wrapper."""
 
     return _adapter(config.model_type).save_weights(_unwrap_compiled_model(model), output_path, source_path)

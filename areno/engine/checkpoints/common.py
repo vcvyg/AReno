@@ -41,8 +41,8 @@ from areno.engine.checkpoints.io import (
     rank0_tensor,
     write_hf_safetensors_checkpoint,
 )
-from areno.engine.parallel.context import get_tp_context
 from areno.engine.layers.linear import _shard_range
+from areno.engine.parallel.context import get_tp_context
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,8 +55,8 @@ class TopLevelSpec:
     norm_attr: str = "norm.weight"
     lm_head_key: str = "lm_head.weight"
     lm_head_attr: str = "lm_head.weight"
-    optional_vocab: tuple["ReplicatedTensorSpec", ...] = ()
-    optional_replicated: tuple["ReplicatedTensorSpec", ...] = ()
+    optional_vocab: tuple[ReplicatedTensorSpec, ...] = ()
+    optional_replicated: tuple[ReplicatedTensorSpec, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,7 +258,9 @@ def copy_merged_column(dst: torch.Tensor, srcs: list[torch.Tensor], rank: int, w
         offset += size
 
 
-def copy_merged_column_from_index(dst: torch.Tensor, index: SafetensorsIndex, tensor_keys: list[str], rank: int, world_size: int) -> None:
+def copy_merged_column_from_index(
+    dst: torch.Tensor, index: SafetensorsIndex, tensor_keys: list[str], rank: int, world_size: int
+) -> None:
     """Pack this rank's TP column shards without materializing full tensors."""
 
     offset = 0
@@ -319,7 +321,9 @@ def split_local_tensors(tensor: torch.Tensor, sizes: list[int]) -> tuple[torch.T
     return tuple(tensor.split(tuple(sizes), dim=0))
 
 
-def load_embedding_norm_head(model: nn.Module, index: SafetensorsIndex, spec: TopLevelSpec, rank: int, world_size: int) -> None:
+def load_embedding_norm_head(
+    model: nn.Module, index: SafetensorsIndex, spec: TopLevelSpec, rank: int, world_size: int
+) -> None:
     """Load token embedding, final norm, LM head, and any optional top-level tensors."""
 
     # Only prefetch small replicated tensors. Vocab-sharded tensors are read
@@ -386,7 +390,9 @@ def load_checkpoint_weights(model: nn.Module, model_path: str, spec: CheckpointS
 
 
 @torch.no_grad()
-def save_checkpoint_weights(model: nn.Module, output_path: str, source_path: str | None, spec: CheckpointSpec) -> str | None:
+def save_checkpoint_weights(
+    model: nn.Module, output_path: str, source_path: str | None, spec: CheckpointSpec
+) -> str | None:
     """Save a tensor-parallel model as a HF sharded safetensors checkpoint."""
 
     tensors = CheckpointTensorStore()
@@ -399,7 +405,9 @@ def save_checkpoint_weights(model: nn.Module, output_path: str, source_path: str
         save_column_tensors(tensors, delayed_column_tensors)
     saved_path = write_hf_safetensors_checkpoint(tensors, output_path, source_path)
     if saved_path is not None and source_path is not None:
-        copy_source_passthrough_weights(source_path, saved_path, protected_prefix=_protected_prefix_from_top_level(spec.top_level))
+        copy_source_passthrough_weights(
+            source_path, saved_path, protected_prefix=_protected_prefix_from_top_level(spec.top_level)
+        )
     return saved_path
 
 
@@ -422,7 +430,9 @@ def copy_source_passthrough_weights(source_path: str | Path, output_path: str | 
     source_weight_map = _read_weight_map(source)
     output_index = json.loads(output_index_path.read_text())
     output_weight_map = dict(output_index["weight_map"])
-    passthrough_keys = [key for key in source_weight_map if not key.startswith(protected_prefix) and key not in output_weight_map]
+    passthrough_keys = [
+        key for key in source_weight_map if not key.startswith(protected_prefix) and key not in output_weight_map
+    ]
     if not passthrough_keys:
         return
 
@@ -482,7 +492,9 @@ def load_layer_specs(model: nn.Module, index: SafetensorsIndex, spec: LayerSpec,
         index.drop(layer_keys)
 
 
-def save_layer_specs(tensors: dict[str, torch.Tensor | None], model: nn.Module, spec: LayerSpec, context: object | None = None) -> None:
+def save_layer_specs(
+    tensors: dict[str, torch.Tensor | None], model: nn.Module, spec: LayerSpec, context: object | None = None
+) -> None:
     """Stage all per-layer tensors via the spec's `save_ops` and handlers."""
 
     for layer_idx, layer in enumerate(model.layers):
@@ -494,7 +506,9 @@ def save_layer_specs(tensors: dict[str, torch.Tensor | None], model: nn.Module, 
             handler(tensors, prefix, layer, context)
 
 
-def load_replicated_tensors(module: nn.Module, index: SafetensorsIndex, prefix: str, specs: tuple[ReplicatedTensorSpec, ...]) -> None:
+def load_replicated_tensors(
+    module: nn.Module, index: SafetensorsIndex, prefix: str, specs: tuple[ReplicatedTensorSpec, ...]
+) -> None:
     """Copy fully replicated tensors directly into module attributes."""
 
     for spec in specs:
@@ -514,7 +528,9 @@ def save_replicated_tensors(
         tensors[key(spec.key, prefix)] = rank0_tensor(attr_path(module, spec.attr))
 
 
-def load_layer_op(module: nn.Module, index: SafetensorsIndex, prefix: str, op: object, rank: int, world_size: int) -> None:
+def load_layer_op(
+    module: nn.Module, index: SafetensorsIndex, prefix: str, op: object, rank: int, world_size: int
+) -> None:
     """Dispatch a single layer load op based on its declarative type."""
 
     if isinstance(op, ReplicatedTensorSpec):
@@ -528,7 +544,9 @@ def load_layer_op(module: nn.Module, index: SafetensorsIndex, prefix: str, op: o
             dst.copy_(index.get_tensor(tensor_key).to(dtype=dst.dtype))
         return
     if isinstance(op, ParallelTensorSpec):
-        _copy_parallel_tensor_from_index(attr_path(module, op.attr), index, key(op.key, prefix), op.dim, rank, world_size)
+        _copy_parallel_tensor_from_index(
+            attr_path(module, op.attr), index, key(op.key, prefix), op.dim, rank, world_size
+        )
         return
     if isinstance(op, MergedColumnSpec):
         load_merged_column_spec(module, index, prefix, op, rank, world_size)
@@ -557,7 +575,9 @@ def load_layer_op(module: nn.Module, index: SafetensorsIndex, prefix: str, op: o
     raise TypeError(f"unsupported checkpoint load op {type(op)!r}")
 
 
-def save_layer_op(tensors: dict[str, torch.Tensor | None], module: nn.Module, prefix: str, op: object, context: object | None) -> None:
+def save_layer_op(
+    tensors: dict[str, torch.Tensor | None], module: nn.Module, prefix: str, op: object, context: object | None
+) -> None:
     """Dispatch a single layer save op based on its declarative type."""
 
     if isinstance(op, ReplicatedTensorSpec):
@@ -583,7 +603,9 @@ def save_layer_op(tensors: dict[str, torch.Tensor | None], module: nn.Module, pr
         return
     if isinstance(op, OptionalRangedSplitColumnSpec):
         if optional_attr_path(module, op.src_attr) is not None:
-            save_ranged_split_column_spec(tensors, module, prefix, RangedSplitColumnSpec(op.src_attr, op.size_attr, op.keys))
+            save_ranged_split_column_spec(
+                tensors, module, prefix, RangedSplitColumnSpec(op.src_attr, op.size_attr, op.keys)
+            )
         return
     if isinstance(op, AttentionSpec):
         save_attention_spec(tensors, module, prefix, op, context)
@@ -618,14 +640,18 @@ def _copy_parallel_tensor(dst: torch.Tensor, src: torch.Tensor, dim: int, rank: 
     raise ValueError(f"unsupported tensor-parallel dim {dim}")
 
 
-def _copy_parallel_tensor_from_index(dst: torch.Tensor, index: SafetensorsIndex, tensor_key: str, dim: int, rank: int, world_size: int) -> None:
+def _copy_parallel_tensor_from_index(
+    dst: torch.Tensor, index: SafetensorsIndex, tensor_key: str, dim: int, rank: int, world_size: int
+) -> None:
     """Copy one TP shard from safetensors without loading the full tensor."""
 
     shard = _read_tp_shard(index, tensor_key, dim=dim, rank=rank, world_size=world_size)
     dst.copy_(shard.to(dtype=dst.dtype))
 
 
-def _copy_vocab_shard_from_index(dst: torch.Tensor, index: SafetensorsIndex, tensor_key: str, rank: int, world_size: int) -> None:
+def _copy_vocab_shard_from_index(
+    dst: torch.Tensor, index: SafetensorsIndex, tensor_key: str, rank: int, world_size: int
+) -> None:
     """Copy this rank's vocab shard directly from safetensors."""
 
     shard = _read_tp_shard(index, tensor_key, dim=0, rank=rank, world_size=world_size)
@@ -662,7 +688,9 @@ def _read_explicit_shard(index: SafetensorsIndex, tensor_key: str, dim: int, sta
         return tensor_slice[tuple(slices)]
 
 
-def load_merged_column_spec(module: nn.Module, index: SafetensorsIndex, prefix: str, spec: MergedColumnSpec, rank: int, world_size: int) -> None:
+def load_merged_column_spec(
+    module: nn.Module, index: SafetensorsIndex, prefix: str, spec: MergedColumnSpec, rank: int, world_size: int
+) -> None:
     """Load multiple HF column tensors into one fused local column module."""
 
     dst = attr_path(module, spec.dst_attr)
@@ -675,7 +703,9 @@ def load_merged_column_spec(module: nn.Module, index: SafetensorsIndex, prefix: 
     copy_merged_column_from_index(dst, index, tensor_keys, rank, world_size)
 
 
-def load_k_shared_qkv_column_spec(module: nn.Module, index: SafetensorsIndex, prefix: str, spec: KSharedQKVColumnSpec, rank: int, world_size: int) -> None:
+def load_k_shared_qkv_column_spec(
+    module: nn.Module, index: SafetensorsIndex, prefix: str, spec: KSharedQKVColumnSpec, rank: int, world_size: int
+) -> None:
     """Load QKV where late layers may share K/V or omit them entirely.
 
     When K is present, V is reused from K if missing and the three tensors are
@@ -721,7 +751,9 @@ def load_merged_optional_bias_spec(
     copy_merged_optional_bias(dst, index, keys(spec.keys, prefix), rank, world_size)
 
 
-def save_split_column_spec(tensors: dict[str, torch.Tensor | None], module: nn.Module, prefix: str, spec: SplitColumnSpec) -> None:
+def save_split_column_spec(
+    tensors: dict[str, torch.Tensor | None], module: nn.Module, prefix: str, spec: SplitColumnSpec
+) -> None:
     """Split a fused local column into its component HF tensors and gather them."""
 
     parts = split_local_tensors(attr_path(module, spec.src_attr), attr_path(module, spec.size_attr))
@@ -730,7 +762,9 @@ def save_split_column_spec(tensors: dict[str, torch.Tensor | None], module: nn.M
         tensors[key(template, prefix)] = tensor
 
 
-def save_ranged_split_column_spec(tensors: dict[str, torch.Tensor | None], module: nn.Module, prefix: str, spec: RangedSplitColumnSpec) -> None:
+def save_ranged_split_column_spec(
+    tensors: dict[str, torch.Tensor | None], module: nn.Module, prefix: str, spec: RangedSplitColumnSpec
+) -> None:
     """Save split QKV tensors whose local K/V ranges may be replicated."""
 
     parts = split_local_tensors(attr_path(module, spec.src_attr), attr_path(module, spec.size_attr))
@@ -784,7 +818,9 @@ def load_row_parallel_tensors(
     """Copy row-sharded tensors (dim 1) from HF into the live module."""
 
     for spec in specs:
-        _copy_parallel_tensor_from_index(attr_path(module, spec.attr), index, key(spec.key, prefix), dim=1, rank=rank, world_size=world_size)
+        _copy_parallel_tensor_from_index(
+            attr_path(module, spec.attr), index, key(spec.key, prefix), dim=1, rank=rank, world_size=world_size
+        )
 
 
 def save_column_linear(tensors: dict[str, torch.Tensor | None], prefix: str, module: nn.Module) -> None:
@@ -840,7 +876,9 @@ def copy_dense_mlp(mlp: nn.Module, index: SafetensorsIndex, prefix: str, rank: i
     _copy_row(mlp.down_proj.weight, index.get_tensor(f"{prefix}.down_proj.weight"), rank, world_size)
 
 
-def load_dense_or_moe_spec(module: nn.Module, index: SafetensorsIndex, prefix: str, spec: DenseOrMoeSpec, rank: int, world_size: int) -> None:
+def load_dense_or_moe_spec(
+    module: nn.Module, index: SafetensorsIndex, prefix: str, spec: DenseOrMoeSpec, rank: int, world_size: int
+) -> None:
     """Dispatch MLP load to dense or MoE based on the live module's structure."""
 
     mlp = attr_path(module, spec.attr)
@@ -852,7 +890,9 @@ def load_dense_or_moe_spec(module: nn.Module, index: SafetensorsIndex, prefix: s
     copy_dense_mlp(mlp, index, mlp_prefix, rank, world_size)
 
 
-def save_dense_or_moe_spec(tensors: dict[str, torch.Tensor | None], module: nn.Module, prefix: str, spec: DenseOrMoeSpec) -> None:
+def save_dense_or_moe_spec(
+    tensors: dict[str, torch.Tensor | None], module: nn.Module, prefix: str, spec: DenseOrMoeSpec
+) -> None:
     """Mirror of `load_dense_or_moe_spec` for checkpoint saving."""
 
     mlp = attr_path(module, spec.attr)
@@ -863,7 +903,9 @@ def save_dense_or_moe_spec(tensors: dict[str, torch.Tensor | None], module: nn.M
     save_dense_mlp(tensors, mlp_prefix, mlp)
 
 
-def load_attention_spec(module: nn.Module, index: SafetensorsIndex, prefix: str, spec: AttentionSpec, rank: int, world_size: int) -> None:
+def load_attention_spec(
+    module: nn.Module, index: SafetensorsIndex, prefix: str, spec: AttentionSpec, rank: int, world_size: int
+) -> None:
     """Load attention block; handles MLA, fused QKV, split QKV, gated-attn variants."""
 
     attn = attr_path(module, spec.attr)
@@ -878,9 +920,13 @@ def load_attention_spec(module: nn.Module, index: SafetensorsIndex, prefix: str,
     dense_prefix = existing_prefix(index, attn_prefix, ("dense", "o_proj"))
     if qkv_prefix is not None:
         # Pre-fused QKV in HF -> just reshard along TP heads.
-        copy_attention_qkv(attn.query_key_value.weight, index.get_tensor(f"{qkv_prefix}.weight"), attn, rank, world_size)
+        copy_attention_qkv(
+            attn.query_key_value.weight, index.get_tensor(f"{qkv_prefix}.weight"), attn, rank, world_size
+        )
         if attn.query_key_value.bias is not None and f"{qkv_prefix}.bias" in index.weight_map:
-            copy_attention_qkv(attn.query_key_value.bias, index.get_tensor(f"{qkv_prefix}.bias"), attn, rank, world_size)
+            copy_attention_qkv(
+                attn.query_key_value.bias, index.get_tensor(f"{qkv_prefix}.bias"), attn, rank, world_size
+            )
     else:
         # Separate Q/K/V tensors in HF -> assemble into the fused local layout.
         copy_split_qkv(attn, index, attn_prefix, rank, world_size)
@@ -970,8 +1016,12 @@ def copy_mla_attention(attn: nn.Module, index: SafetensorsIndex, prefix: str, ra
 
     _copy_column(attn.q_proj.weight, index.get_tensor(f"{prefix}.q_proj.weight"), rank, world_size)
     # kv_a_proj_with_mqa and kv_a_layernorm are replicated across TP ranks.
-    attn.kv_a_proj_with_mqa.weight.copy_(index.get_tensor(f"{prefix}.kv_a_proj_with_mqa.weight").to(dtype=attn.kv_a_proj_with_mqa.weight.dtype))
-    attn.kv_a_layernorm.weight.copy_(index.get_tensor(f"{prefix}.kv_a_layernorm.weight").to(dtype=attn.kv_a_layernorm.weight.dtype))
+    attn.kv_a_proj_with_mqa.weight.copy_(
+        index.get_tensor(f"{prefix}.kv_a_proj_with_mqa.weight").to(dtype=attn.kv_a_proj_with_mqa.weight.dtype)
+    )
+    attn.kv_a_layernorm.weight.copy_(
+        index.get_tensor(f"{prefix}.kv_a_layernorm.weight").to(dtype=attn.kv_a_layernorm.weight.dtype)
+    )
     _copy_column(attn.kv_b_proj.weight, index.get_tensor(f"{prefix}.kv_b_proj.weight"), rank, world_size)
     dense_prefix = existing_prefix(index, prefix, ("dense", "o_proj"))
     _copy_row(attn.dense.weight, index.get_tensor(f"{dense_prefix}.weight"), rank, world_size)
@@ -1003,7 +1053,11 @@ def copy_split_qkv(attn: nn.Module, index: SafetensorsIndex, prefix: str, rank: 
     v = index.get_tensor(f"{v_key}.weight")
     q_start, q_end = _shard_range(q.shape[0], rank, world_size)
     k_start, k_end = _shard_range(k.shape[0], rank, world_size)
-    attn.query_key_value.weight.copy_(torch.cat([q[q_start:q_end], k[k_start:k_end], v[k_start:k_end]], dim=0).to(dtype=attn.query_key_value.weight.dtype))
+    attn.query_key_value.weight.copy_(
+        torch.cat([q[q_start:q_end], k[k_start:k_end], v[k_start:k_end]], dim=0).to(
+            dtype=attn.query_key_value.weight.dtype
+        )
+    )
 
 
 def copy_column_vector(dst: torch.Tensor, src: torch.Tensor, rank: int, world_size: int) -> None:
@@ -1067,7 +1121,9 @@ def delayed_column_tensors(context: object | None) -> list[tuple[str, torch.Tens
     return context
 
 
-def load_moe_spec(module: nn.Module, index: SafetensorsIndex, prefix: str, spec: MoeSpec, rank: int, world_size: int) -> None:
+def load_moe_spec(
+    module: nn.Module, index: SafetensorsIndex, prefix: str, spec: MoeSpec, rank: int, world_size: int
+) -> None:
     """Load MoE gate, optional expert bias, all expert weights, and shared experts."""
 
     gate_weight = attr_path(module, spec.gate_weight_attr)
@@ -1117,9 +1173,15 @@ def save_moe_spec(tensors: dict[str, torch.Tensor | None], prefix: str, module: 
         gate_key = expert_key(spec.expert_gate_key, prefix, expert_id)
         up_key = expert_key(spec.expert_up_key, prefix, expert_id)
         down_key = expert_key(spec.expert_down_key, prefix, expert_id)
-        tensors[gate_key] = _tensor_to_cpu(gate_weights[expert_id].contiguous()) if _owns_checkpoint_tensor(gate_key) else None
-        tensors[up_key] = _tensor_to_cpu(up_weights[expert_id].contiguous()) if _owns_checkpoint_tensor(up_key) else None
-        tensors[down_key] = _tensor_to_cpu(down_weights[expert_id].contiguous()) if _owns_checkpoint_tensor(down_key) else None
+        tensors[gate_key] = (
+            _tensor_to_cpu(gate_weights[expert_id].contiguous()) if _owns_checkpoint_tensor(gate_key) else None
+        )
+        tensors[up_key] = (
+            _tensor_to_cpu(up_weights[expert_id].contiguous()) if _owns_checkpoint_tensor(up_key) else None
+        )
+        tensors[down_key] = (
+            _tensor_to_cpu(down_weights[expert_id].contiguous()) if _owns_checkpoint_tensor(down_key) else None
+        )
 
     if spec.shared_experts_attr is not None and spec.shared_experts_prefix is not None:
         shared_experts = attr_path(module, spec.shared_experts_attr)

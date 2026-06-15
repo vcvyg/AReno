@@ -36,6 +36,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from areno.accel.ops import log_once
 from areno.engine.config import ModelConfig, _parse_dtype
 from areno.engine.layers.attention_backend.infer import FlashAttnInferBackend, build_infer_attention_backend
 from areno.engine.layers.attention_backend.train import build_train_attention_backend
@@ -44,8 +45,6 @@ from areno.engine.layers.mlp import GatedMLP
 from areno.engine.layers.norm import RMSNorm
 from areno.engine.layers.rotary import PartialRotaryEmbedding
 from areno.engine.layers.vocab import VocabParallelEmbedding, VocabParallelLMHead
-from areno.models.base import CausalLMOutput, ModelAdapter
-from areno.accel.ops import log_once
 from areno.engine.parallel.collectives import scatter_to_sequence_parallel_region, sequence_parallel_region
 from areno.engine.parallel.context import get_tp_context
 from areno.engine.runtime.metadata import InferMeta, TrainMeta
@@ -62,7 +61,7 @@ from areno.models._shared.dynamo_wrappers import (
     _fla_fused_recurrent_gated_delta_rule_no_compile,
     _require_fla_gdn,
 )
-
+from areno.models.base import CausalLMOutput, ModelAdapter
 
 # Gated Delta-Net topology constants (fixed by the MiniCPM-V-4.6 architecture,
 # not exposed in the HF config). 16 heads of dim 128 -> 2048-d key/value path.
@@ -203,7 +202,9 @@ class MiniCPMGatedDeltaNet(nn.Module):
         # Fused (b, a) projection — per-head scalars.
         self.in_proj_ba = MergedColumnParallelLinear(config.hidden_size, (self.num_heads, self.num_heads), bias=False)
         # Depthwise causal conv1d weight: one filter per channel (groups=channels).
-        self.conv1d_weight = nn.Parameter(torch.empty(self.local_key_dim * 2 + self.local_value_dim, 1, self.conv_kernel_size))
+        self.conv1d_weight = nn.Parameter(
+            torch.empty(self.local_key_dim * 2 + self.local_value_dim, 1, self.conv_kernel_size)
+        )
         mark_tensor_parallel_parameter(self.conv1d_weight, True, sequence_parallel=True)
         # Per-head time-step bias and (log) decay parameter.
         self.dt_bias = nn.Parameter(torch.empty(self.local_heads))
@@ -230,7 +231,9 @@ class MiniCPMGatedDeltaNet(nn.Module):
         qkvz = self.in_proj_qkvz(hidden_states)
         ba = self.in_proj_ba(hidden_states)
         # Mix only the (q, k, v) prefix through the causal conv; z bypasses.
-        mixed_qkv = self._causal_conv(qkvz[..., : self.local_key_dim * 2 + self.local_value_dim], train_meta, infer_meta)
+        mixed_qkv = self._causal_conv(
+            qkvz[..., : self.local_key_dim * 2 + self.local_value_dim], train_meta, infer_meta
+        )
         query_key, value = mixed_qkv.split((self.local_key_dim * 2, self.local_value_dim), dim=-1)
         z = qkvz[..., self.local_key_dim * 2 + self.local_value_dim :]
         b_gate, a_gate = ba.split((self.local_heads, self.local_heads), dim=-1)
@@ -243,7 +246,9 @@ class MiniCPMGatedDeltaNet(nn.Module):
         else:
             # Training path computes the decay and update-gate in eager Python
             # (it fuses cleanly under the recurrent kernel call).
-            g = -self.A_log.float().exp().view(1, 1, -1) * F.softplus(a_gate.float() + self.dt_bias.float().view(1, 1, -1))
+            g = -self.A_log.float().exp().view(1, 1, -1) * F.softplus(
+                a_gate.float() + self.dt_bias.float().view(1, 1, -1)
+            )
             beta = torch.sigmoid(b_gate)
             out = self._forward_train(query, key, value, g, beta, train_meta)
         out = self._rmsnorm_gate(out, z).reshape(batch, seqlen, self.local_value_dim)
@@ -306,7 +311,9 @@ class MiniCPMGatedDeltaNet(nn.Module):
         raise ValueError(f"unsupported inference mode: {infer_meta.mode}")
 
     @torch._dynamo.disable
-    def _causal_conv_infer_prefill(self, x: torch.Tensor, cu_seqlens: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    def _causal_conv_infer_prefill(
+        self, x: torch.Tensor, cu_seqlens: torch.Tensor, slots: torch.Tensor
+    ) -> torch.Tensor:
         out = torch.empty_like(x)
         cu = cu_seqlens.to(device=x.device, dtype=torch.long)
         for idx, slot in enumerate(slots):
@@ -375,7 +382,9 @@ class MiniCPMGatedDeltaNet(nn.Module):
             a = a.reshape(1, -1, self.local_heads)
             b = b.reshape(1, -1, self.local_heads)
             _require_fla_gdn()
-            g = -self.A_log.float().exp().view(1, 1, -1) * _areno_softplus_no_compile(a.float() + self.dt_bias.float().view(1, 1, -1))
+            g = -self.A_log.float().exp().view(1, 1, -1) * _areno_softplus_no_compile(
+                a.float() + self.dt_bias.float().view(1, 1, -1)
+            )
             beta = _areno_sigmoid_no_compile(b)
             initial_state = self.state_cache.index_select(0, slots).to(device=q.device)
             out, state = _fla_fused_recurrent_gated_delta_rule_no_compile(
@@ -399,7 +408,9 @@ class MiniCPMGatedDeltaNet(nn.Module):
         # Prefill: compute decay/beta in Python (the kernel takes them
         # pre-computed), seed the recurrent kernel with the saved state, and
         # write the final state back into the cache.
-        g = -self.A_log.float().exp().view(1, 1, -1) * _areno_softplus_no_compile(a.float() + self.dt_bias.float().view(1, 1, -1))
+        g = -self.A_log.float().exp().view(1, 1, -1) * _areno_softplus_no_compile(
+            a.float() + self.dt_bias.float().view(1, 1, -1)
+        )
         beta = _areno_sigmoid_no_compile(b)
         initial_state = self.state_cache.index_select(0, slots).to(device=q.device)
         out, state = _fla_fused_recurrent_gated_delta_rule_no_compile(
@@ -448,7 +459,11 @@ class MiniCPMDecoderLayer(nn.Module):
         # Layer type comes from the HF config's ``layer_types`` list.
         layer_type = (config.layer_types or ())[layer_idx]
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.attention = MiniCPMFullAttention(config, layer_idx) if layer_type == "full_attention" else MiniCPMGatedDeltaNet(config, layer_idx)
+        self.attention = (
+            MiniCPMFullAttention(config, layer_idx)
+            if layer_type == "full_attention"
+            else MiniCPMGatedDeltaNet(config, layer_idx)
+        )
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = GatedMLP(config)
 
@@ -461,7 +476,9 @@ class MiniCPMDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # Standard pre-norm residual: norm -> sublayer -> add.
         residual = hidden_states
-        hidden_states = residual + self.attention(self.input_layernorm(hidden_states), position_ids, train_meta, infer_meta)
+        hidden_states = residual + self.attention(
+            self.input_layernorm(hidden_states), position_ids, train_meta, infer_meta
+        )
         residual = hidden_states
         hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states
@@ -532,8 +549,16 @@ class MiniCPMV46ForCausalLM(nn.Module):
             else:
                 # GDN needs both a recurrent state ([heads, head_dim, head_dim])
                 # and (kernel-1) columns of conv history per slot.
-                state = torch.zeros(num_slots, attn.local_heads, attn.head_dim, attn.head_dim, device=device, dtype=torch.float32)
-                conv = torch.zeros(num_slots, attn.local_key_dim * 2 + attn.local_value_dim, attn.conv_kernel_size - 1, device=device, dtype=self.config.dtype)
+                state = torch.zeros(
+                    num_slots, attn.local_heads, attn.head_dim, attn.head_dim, device=device, dtype=torch.float32
+                )
+                conv = torch.zeros(
+                    num_slots,
+                    attn.local_key_dim * 2 + attn.local_value_dim,
+                    attn.conv_kernel_size - 1,
+                    device=device,
+                    dtype=self.config.dtype,
+                )
                 attn.set_state_cache(state, conv)
 
     @torch.no_grad()
@@ -560,15 +585,21 @@ class MiniCPMV46ForCausalLM(nn.Module):
         del tp_group, dp_group
         return None
 
-    def allocate_kv_caches(self, num_blocks: int, block_size: int, device: torch.device) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    def allocate_kv_caches(
+        self, num_blocks: int, block_size: int, device: torch.device
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Allocate paged KV caches for the full-attention layers only."""
         caches = []
         for layer in self.layers:
             attn = layer.attention
             if not isinstance(attn, MiniCPMFullAttention):
                 continue
-            k_cache = torch.empty(num_blocks, block_size, attn.local_kv_heads, attn.head_dim, device=device, dtype=self.config.dtype)
-            v_cache = torch.empty(num_blocks, block_size, attn.local_kv_heads, attn.head_dim, device=device, dtype=self.config.dtype)
+            k_cache = torch.empty(
+                num_blocks, block_size, attn.local_kv_heads, attn.head_dim, device=device, dtype=self.config.dtype
+            )
+            v_cache = torch.empty(
+                num_blocks, block_size, attn.local_kv_heads, attn.head_dim, device=device, dtype=self.config.dtype
+            )
             caches.append((k_cache, v_cache))
         return caches
 
@@ -683,4 +714,3 @@ class MiniCPMV46Adapter(ModelAdapter):
         from areno.models.minicpmv46.checkpoint import save_minicpmv46_weights
 
         return save_minicpmv46_weights(model, output_path, source_path)
-

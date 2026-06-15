@@ -14,9 +14,14 @@ import torch
 from torch import nn
 
 from areno.accel import areno_vocab_embedding
-from areno.engine.parallel.collectives import all_reduce, copy_to_tensor_parallel_region, gather_from_sequence_parallel_region, is_sequence_parallel_active
-from areno.engine.parallel.context import get_tp_context
 from areno.engine.layers.linear import _areno_linear_forward, _shard_range, mark_tensor_parallel_parameter
+from areno.engine.parallel.collectives import (
+    all_reduce,
+    copy_to_tensor_parallel_region,
+    gather_from_sequence_parallel_region,
+    is_sequence_parallel_active,
+)
+from areno.engine.parallel.context import get_tp_context
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -69,5 +74,9 @@ class VocabParallelLMHead(nn.Module):
         # Reassemble the full hidden activation: in SP mode it is sharded
         # along the sequence dim and must be gathered; otherwise we just
         # pass through the TP boundary.
-        hidden_states = gather_from_sequence_parallel_region(hidden_states) if is_sequence_parallel_active() else copy_to_tensor_parallel_region(hidden_states)
+        hidden_states = (
+            gather_from_sequence_parallel_region(hidden_states)
+            if is_sequence_parallel_active()
+            else copy_to_tensor_parallel_region(hidden_states)
+        )
         return _areno_linear_forward(hidden_states, self.weight, None)

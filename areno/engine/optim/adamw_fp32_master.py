@@ -8,12 +8,11 @@ back into the BF16 model parameters so forward/backward sees fresh weights.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import torch
 import torch.distributed as dist
-
 
 # Per-bucket budget for the FP32 flat buffer (in elements, not bytes).
 _DEFAULT_BUCKET_NUMEL = 16 * 1024 * 1024
@@ -164,7 +163,9 @@ class AdamWFP32Master:
             "dp_rank": self.dp_rank,
             "dp_size": self.dp_size,
             # One flat tensor per bucket holding this rank's master shard.
-            "master_params": [bucket.master.detach().clone() if bucket.master is not None else None for bucket in self.buckets],
+            "master_params": [
+                bucket.master.detach().clone() if bucket.master is not None else None for bucket in self.buckets
+            ],
             "state": [
                 {
                     "exp_avg": bucket.exp_avg.detach().clone() if bucket.exp_avg is not None else None,
@@ -221,8 +222,16 @@ class AdamWFP32Master:
                 # Flat-tensor format: single shard tensor for each moment.
                 exp_avg = saved.get("exp_avg") if isinstance(saved, dict) else None
                 exp_avg_sq = saved.get("exp_avg_sq") if isinstance(saved, dict) else None
-                bucket.exp_avg = None if exp_avg is None else exp_avg.detach().to(device=device, dtype=torch.float32).view(-1).clone()
-                bucket.exp_avg_sq = None if exp_avg_sq is None else exp_avg_sq.detach().to(device=device, dtype=torch.float32).view(-1).clone()
+                bucket.exp_avg = (
+                    None
+                    if exp_avg is None
+                    else exp_avg.detach().to(device=device, dtype=torch.float32).view(-1).clone()
+                )
+                bucket.exp_avg_sq = (
+                    None
+                    if exp_avg_sq is None
+                    else exp_avg_sq.detach().to(device=device, dtype=torch.float32).view(-1).clone()
+                )
             bucket.step = int(saved.get("step", 0))
         # The BF16 model weights must be refreshed from the loaded master copy.
         self._copy_master_to_model()
@@ -347,12 +356,8 @@ class AdamWFP32Master:
                 numel = min(_DEFAULT_UPDATE_CHUNK_NUMEL, param.numel() - param_start)
                 # Flush whenever the next chunk would overflow the bucket or
                 # belongs to a different device.
-                flush = (
-                    current
-                    and (
-                        current_device != param.device
-                        or (current_numel + numel > bucket_numel and current_numel > 0)
-                    )
+                flush = current and (
+                    current_device != param.device or (current_numel + numel > bucket_numel and current_numel > 0)
                 )
                 if flush:
                     buckets.append(self._make_bucket(current, current_numel))
@@ -411,9 +416,7 @@ class AdamWFP32Master:
                 if ref.shard_numel == 0:
                     continue
                 model_shard = (
-                    ref.model_param.detach()
-                    .reshape(-1)
-                    .narrow(0, ref.param_start + ref.shard_start, ref.shard_numel)
+                    ref.model_param.detach().reshape(-1).narrow(0, ref.param_start + ref.shard_start, ref.shard_numel)
                 )
                 bucket.master.narrow(0, ref.shard_bucket_start, ref.shard_numel).copy_(model_shard)
         # Adam moments start at zero.

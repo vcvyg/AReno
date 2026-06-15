@@ -13,10 +13,12 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+
 class BackendType(Enum):
     """Available execution backends for an `Trainer`."""
 
     Areno = "Areno"
+
 
 class SamplingParams(BaseModel):
     """Generation controls used by rollout APIs.
@@ -39,6 +41,7 @@ class SamplingParams(BaseModel):
     skip_special_tokens: bool = Field(default=True)
     max_prompt_len: int | None = Field(default=None)
 
+
 class RolloutSequence(BaseModel):
     """One sampled completion returned by rollout.
 
@@ -50,10 +53,12 @@ class RolloutSequence(BaseModel):
     resp_tokens: list[int] = Field(default_factory=list)
     resp_logprobs: list[float] = Field(default_factory=list)
 
+
 class RolloutResult(BaseModel):
     """All sampled completions for one prompt."""
 
     sequences: list[RolloutSequence] = Field(default_factory=list)
+
 
 class TrainSequence(BaseModel):
     """One rollout sequence converted into a policy-gradient training sample.

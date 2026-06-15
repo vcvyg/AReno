@@ -18,14 +18,16 @@ from typing import Any
 import torch
 
 from areno.accel.activations import areno_gelu_tanh_and_mul, areno_silu_and_mul
-from areno.accel.kernels.fused_moe import FusedMoeConfig, fused_experts as areno_fused_experts, is_available as fused_moe_is_available
+from areno.accel.kernels.fused_moe import FusedMoeConfig
+from areno.accel.kernels.fused_moe import fused_experts as areno_fused_experts
+from areno.accel.kernels.fused_moe import is_available as fused_moe_is_available
 from areno.accel.kernels.group_rmsnorm import rms_norm_gate_fwd
 from areno.accel.kernels.seg_la import SegLaMeta, seg_la_fwd
-
 
 logger = logging.getLogger(__name__)
 # Process-wide set of message keys already emitted by log_once/warn_once.
 _LOGGED: set[str] = set()
+
 
 def log_once(key: str, message: str, *, level: int = logging.DEBUG) -> None:
     """Log ``message`` at most once per process for the given ``key``."""

@@ -13,10 +13,10 @@ role-management hooks; this is why the helpers are designed to be small.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
-import asyncio
 from pathlib import Path
 
 import numpy as np
@@ -74,7 +74,9 @@ class PolicyOnlyTrainer:
                     agent_batch = asyncio.run(self._run_agentic_rollout(sampling_params, prompt_batch))
                     self.logger.info("epoch=%d step=%d role=%s stage=rollout_end", epoch, step, role)
                     self._log_agentic_sample_completions(epoch, step, agent_batch)
-                    train_batch, rewards_all, rollout_logprobs = self._materialize_agentic_train_batch(tokenizer, prompt_batch, agent_batch)
+                    train_batch, rewards_all, rollout_logprobs = self._materialize_agentic_train_batch(
+                        tokenizer, prompt_batch, agent_batch
+                    )
                 else:
                     # 1) Sample n_samples completions per prompt; ordering
                     #    matches `prompt_batch.items` so we can zip downstream.
@@ -84,10 +86,14 @@ class PolicyOnlyTrainer:
 
                     # 2+3) Score rewards and broadcast group-normalised
                     #      advantages down to per-token tensors.
-                    train_batch, rewards_all, rollout_logprobs = self._materialize_train_batch(tokenizer, prompt_batch, rollout_results)
+                    train_batch, rewards_all, rollout_logprobs = self._materialize_train_batch(
+                        tokenizer, prompt_batch, rollout_results
+                    )
 
                 if rewards_all:
-                    self.logger.info("epoch=%d step=%d metric=reward_mean value=%.6f", epoch, step, float(np.mean(rewards_all)))
+                    self.logger.info(
+                        "epoch=%d step=%d metric=reward_mean value=%.6f", epoch, step, float(np.mean(rewards_all))
+                    )
                 if rollout_logprobs:
                     self.logger.info(
                         "epoch=%d step=%d metric=rollout_logprob_mean value=%.6f",
@@ -195,10 +201,14 @@ class PolicyOnlyTrainer:
                     samples.append(sample)
                 else:
                     ctx._append_sample_response(existing, sample)
-            samples, filtered_count, filter_diagnostics = self._filter_overlong_agent_samples(ctx, samples, sampling_params)
+            samples, filtered_count, filter_diagnostics = self._filter_overlong_agent_samples(
+                ctx, samples, sampling_params
+            )
             expected = len(agent_batch)
             if len(samples) + filtered_count != expected:
-                raise RuntimeError(f"agent rollout produced {len(samples)} trajectories and filtered {filtered_count}, expected {expected}")
+                raise RuntimeError(
+                    f"agent rollout produced {len(samples)} trajectories and filtered {filtered_count}, expected {expected}"
+                )
             if not samples:
                 raise RuntimeError(
                     f"all {filtered_count} agent trajectories exceeded the configured context length; "

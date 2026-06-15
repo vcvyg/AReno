@@ -7,6 +7,7 @@ and channel scaling in a single CUDA pass. All variants persist a per-row
 ``inv_rms`` tensor across forward/backward so the gradient kernel avoids the
 extra reduction.
 """
+
 import torch
 
 from areno.accel._extension import extension as _extension

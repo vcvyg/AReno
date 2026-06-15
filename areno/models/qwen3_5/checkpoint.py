@@ -24,11 +24,16 @@ from areno.engine.checkpoints.common import (
     save_embedding_norm_head,
     write_hf_safetensors_checkpoint,
 )
-from areno.engine.checkpoints.io import SafetensorsIndex, _all_gather_tensor_parallel, _copy_row, _owns_checkpoint_tensor, _tensor_to_cpu
+from areno.engine.checkpoints.io import (
+    SafetensorsIndex,
+    _all_gather_tensor_parallel,
+    _copy_row,
+    _owns_checkpoint_tensor,
+    _tensor_to_cpu,
+)
 from areno.engine.layers.linear import _shard_range
 from areno.engine.parallel.context import get_tp_context
 from areno.models.qwen3_5.model import Qwen35DecoderLayer, Qwen35ForCausalLM, Qwen35FullAttention, Qwen35GatedDeltaNet
-
 
 LAYER_NORM_SPECS = (
     ReplicatedTensorSpec("{prefix}.input_layernorm.weight", "input_layernorm.weight"),
@@ -58,6 +63,8 @@ GDN_KEYS = (
     "{prefix}.linear_attn.norm.weight",
     "{prefix}.linear_attn.out_proj.weight",
 )
+
+
 @torch.no_grad()
 def load_qwen35_weights(model: Qwen35ForCausalLM, model_path: str | Path) -> None:
     ctx = get_tp_context()
@@ -77,7 +84,9 @@ def load_qwen35_weights(model: Qwen35ForCausalLM, model_path: str | Path) -> Non
 
 
 @torch.no_grad()
-def save_qwen35_weights(model: Qwen35ForCausalLM, output_path: str | Path, source_path: str | Path | None) -> str | None:
+def save_qwen35_weights(
+    model: Qwen35ForCausalLM, output_path: str | Path, source_path: str | Path | None
+) -> str | None:
     tensors = CheckpointTensorStore()
     prefix = model.config.checkpoint_prefix
     _save_embedding_norm_head(tensors, model, prefix)
@@ -117,7 +126,9 @@ def _resolve_lm_head_key(index: SafetensorsIndex, prefix: str, tie_word_embeddin
     raise KeyError(f"could not find Qwen3.5 LM head; checked: {', '.join(candidates)}")
 
 
-def _load_embedding_norm_head(model: Qwen35ForCausalLM, index: SafetensorsIndex, prefix: str, rank: int, world_size: int) -> None:
+def _load_embedding_norm_head(
+    model: Qwen35ForCausalLM, index: SafetensorsIndex, prefix: str, rank: int, world_size: int
+) -> None:
     spec = _top_level_spec(prefix, model.config.checkpoint_lm_head_key)
     load_embedding_norm_head(model, index, spec, rank, world_size)
     model.norm.weight.add_(1.0)
@@ -144,7 +155,9 @@ def _load_layer(index: SafetensorsIndex, layer: Qwen35DecoderLayer, prefix: str,
         *[spec.key.format(prefix=prefix) for spec in LAYER_NORM_SPECS],
     ]
     if not is_moe:
-        keys.extend([*[key.format(prefix=prefix) for key in GATE_UP_WEIGHT_SPEC.keys], MLP_ROW_SPEC.key.format(prefix=prefix)])
+        keys.extend(
+            [*[key.format(prefix=prefix) for key in GATE_UP_WEIGHT_SPEC.keys], MLP_ROW_SPEC.key.format(prefix=prefix)]
+        )
     keys.extend(_attention_keys(layer.attention, prefix))
     index.prefetch([key for key in keys if key in index.weight_map])
 
@@ -273,7 +286,9 @@ def _load_router_gate(index: SafetensorsIndex, gate: torch.Tensor, prefix: str) 
             gate.copy_(tensor[:, : gate.shape[0]].t().contiguous().to(dtype=gate.dtype))
             return
     extra = _gate_key_shape_candidates(index, prefix)
-    raise KeyError(f"missing Qwen3.5-MoE router gate with shape {tuple(gate.shape)} under {prefix}; checked: {seen_shapes + extra}")
+    raise KeyError(
+        f"missing Qwen3.5-MoE router gate with shape {tuple(gate.shape)} under {prefix}; checked: {seen_shapes + extra}"
+    )
 
 
 def _load_routed_experts(index: SafetensorsIndex, mlp: nn.Module, prefix: str, rank: int, world_size: int) -> None:
@@ -310,7 +325,11 @@ def _load_routed_experts(index: SafetensorsIndex, mlp: nn.Module, prefix: str, r
     gate_key, up_key, down_key = _first_existing_triple(
         index,
         (
-            (f"{prefix}.experts.gate_proj.weight", f"{prefix}.experts.up_proj.weight", f"{prefix}.experts.down_proj.weight"),
+            (
+                f"{prefix}.experts.gate_proj.weight",
+                f"{prefix}.experts.up_proj.weight",
+                f"{prefix}.experts.down_proj.weight",
+            ),
             (f"{prefix}.experts.gate_proj", f"{prefix}.experts.up_proj", f"{prefix}.experts.down_proj"),
         ),
     )
@@ -337,12 +356,18 @@ def _load_routed_experts(index: SafetensorsIndex, mlp: nn.Module, prefix: str, r
     raise KeyError(f"missing Qwen3.5-MoE expert weights under {prefix}.experts; found candidates: {candidates}")
 
 
-def _copy_packed_gate_up_down_experts(experts: nn.Module, gate_up: torch.Tensor, down: torch.Tensor, common_gate: torch.Tensor | None = None) -> None:
+def _copy_packed_gate_up_down_experts(
+    experts: nn.Module, gate_up: torch.Tensor, down: torch.Tensor, common_gate: torch.Tensor | None = None
+) -> None:
     start = int(getattr(experts, "local_expert_start"))
     end = int(getattr(experts, "local_expert_end"))
     gate_up_weight = getattr(experts, "gate_up_weight")
     down_weight = getattr(experts, "down_weight")
-    gate_up_weight.copy_(_local_gate_up_tensor(gate_up, gate_up_weight, start, end, common_gate=common_gate).to(dtype=gate_up_weight.dtype))
+    gate_up_weight.copy_(
+        _local_gate_up_tensor(gate_up, gate_up_weight, start, end, common_gate=common_gate).to(
+            dtype=gate_up_weight.dtype
+        )
+    )
     down_weight.copy_(_local_expert_tensor(down, down_weight, start, end, "down").to(dtype=down_weight.dtype))
 
 
@@ -358,7 +383,9 @@ def _copy_packed_split_experts(experts: nn.Module, gate: torch.Tensor, up: torch
     down_weight.copy_(_local_expert_tensor(down, down_weight, start, end, "down").to(dtype=down_weight.dtype))
 
 
-def _local_gate_up_tensor(source: torch.Tensor, target: torch.Tensor, start: int, end: int, common_gate: torch.Tensor | None) -> torch.Tensor:
+def _local_gate_up_tensor(
+    source: torch.Tensor, target: torch.Tensor, start: int, end: int, common_gate: torch.Tensor | None
+) -> torch.Tensor:
     try:
         return _local_expert_tensor(source, target, start, end, "gate_up")
     except ValueError:
@@ -383,7 +410,9 @@ def _common_expert_gate(index: SafetensorsIndex, prefix: str, target: torch.Tens
     return None
 
 
-def _local_expert_tensor(source: torch.Tensor, target: torch.Tensor | tuple[int, int, int], start: int, end: int, name: str) -> torch.Tensor:
+def _local_expert_tensor(
+    source: torch.Tensor, target: torch.Tensor | tuple[int, int, int], start: int, end: int, name: str
+) -> torch.Tensor:
     target_shape = tuple(target.shape if isinstance(target, torch.Tensor) else target)
     if source.ndim != 3:
         raise ValueError(f"Qwen3.5-MoE {name} expert tensor must be 3D, got shape {tuple(source.shape)}")
@@ -393,7 +422,9 @@ def _local_expert_tensor(source: torch.Tensor, target: torch.Tensor | tuple[int,
         candidate = source.permute(perm)
         if tuple(candidate.shape[1:]) == target_shape[1:] and candidate.shape[0] >= end:
             return candidate[start:end].contiguous()
-    raise ValueError(f"cannot map Qwen3.5-MoE {name} expert tensor shape {tuple(source.shape)} to local shape {target_shape}")
+    raise ValueError(
+        f"cannot map Qwen3.5-MoE {name} expert tensor shape {tuple(source.shape)} to local shape {target_shape}"
+    )
 
 
 def _load_shared_expert(index: SafetensorsIndex, mlp: nn.Module, prefix: str, rank: int, world_size: int) -> None:
@@ -419,7 +450,9 @@ def _first_existing_pair(index: SafetensorsIndex, pairs: tuple[tuple[str, str], 
     return None, None
 
 
-def _first_existing_triple(index: SafetensorsIndex, triples: tuple[tuple[str, str, str], ...]) -> tuple[str | None, str | None, str | None]:
+def _first_existing_triple(
+    index: SafetensorsIndex, triples: tuple[tuple[str, str, str], ...]
+) -> tuple[str | None, str | None, str | None]:
     for first, second, third in triples:
         if first in index.weight_map and second in index.weight_map and third in index.weight_map:
             return first, second, third
@@ -428,7 +461,9 @@ def _first_existing_triple(index: SafetensorsIndex, triples: tuple[tuple[str, st
 
 def _gate_key_shape_candidates(index: SafetensorsIndex, prefix: str) -> list[str]:
     out = []
-    for candidate in sorted(key for key in index.weight_map if key.startswith(prefix) and ("gate" in key or "router" in key)):
+    for candidate in sorted(
+        key for key in index.weight_map if key.startswith(prefix) and ("gate" in key or "router" in key)
+    ):
         if len(out) >= 8:
             break
         out.append(candidate)
@@ -463,13 +498,20 @@ def _moe_mlp_keys(index: SafetensorsIndex, mlp: nn.Module, prefix: str) -> set[s
     gate_key, up_key, down_key = _first_existing_triple(
         index,
         (
-            (f"{prefix}.experts.gate_proj.weight", f"{prefix}.experts.up_proj.weight", f"{prefix}.experts.down_proj.weight"),
+            (
+                f"{prefix}.experts.gate_proj.weight",
+                f"{prefix}.experts.up_proj.weight",
+                f"{prefix}.experts.down_proj.weight",
+            ),
             (f"{prefix}.experts.gate_proj", f"{prefix}.experts.up_proj", f"{prefix}.experts.down_proj"),
-        )
+        ),
     )
     if gate_key is not None and up_key is not None and down_key is not None:
         keys.update((gate_key, up_key, down_key))
-    elif not any(key.startswith(f"{prefix}.experts.") for key in keys) and f"{prefix}.experts.0.gate_proj.weight" in index.weight_map:
+    elif (
+        not any(key.startswith(f"{prefix}.experts.") for key in keys)
+        and f"{prefix}.experts.0.gate_proj.weight" in index.weight_map
+    ):
         for expert_id in range(int(getattr(mlp, "num_experts"))):
             keys.add(f"{prefix}.experts.{expert_id}.gate_proj.weight")
             keys.add(f"{prefix}.experts.{expert_id}.up_proj.weight")
@@ -487,7 +529,9 @@ def _moe_mlp_keys(index: SafetensorsIndex, mlp: nn.Module, prefix: str) -> set[s
     return keys
 
 
-def _load_full_attention(index: SafetensorsIndex, attn: Qwen35FullAttention, prefix: str, rank: int, world_size: int) -> None:
+def _load_full_attention(
+    index: SafetensorsIndex, attn: Qwen35FullAttention, prefix: str, rank: int, world_size: int
+) -> None:
     q_weight = index.get_tensor(f"{prefix}.self_attn.q_proj.weight")
     k_weight = index.get_tensor(f"{prefix}.self_attn.k_proj.weight")
     v_weight = index.get_tensor(f"{prefix}.self_attn.v_proj.weight")
@@ -503,15 +547,34 @@ def _load_full_attention(index: SafetensorsIndex, attn: Qwen35FullAttention, pre
     else:
         copy_merged_column(attn.qkv_proj.weight, [q_weight, k_weight, v_weight], rank, world_size)
     _copy_row(attn.o_proj.weight, index.get_tensor(f"{prefix}.self_attn.o_proj.weight"), rank, world_size)
-    attn.q_norm.weight.copy_((index.get_tensor(f"{prefix}.self_attn.q_norm.weight") + 1.0).to(dtype=attn.q_norm.weight.dtype))
-    attn.k_norm.weight.copy_((index.get_tensor(f"{prefix}.self_attn.k_norm.weight") + 1.0).to(dtype=attn.k_norm.weight.dtype))
+    attn.q_norm.weight.copy_(
+        (index.get_tensor(f"{prefix}.self_attn.q_norm.weight") + 1.0).to(dtype=attn.q_norm.weight.dtype)
+    )
+    attn.k_norm.weight.copy_(
+        (index.get_tensor(f"{prefix}.self_attn.k_norm.weight") + 1.0).to(dtype=attn.k_norm.weight.dtype)
+    )
 
 
-def _load_gated_delta_net(index: SafetensorsIndex, attn: Qwen35GatedDeltaNet, prefix: str, rank: int, world_size: int) -> None:
+def _load_gated_delta_net(
+    index: SafetensorsIndex, attn: Qwen35GatedDeltaNet, prefix: str, rank: int, world_size: int
+) -> None:
     qkv = index.get_tensor(f"{prefix}.linear_attn.in_proj_qkv.weight")
     q, k, v = qkv.split((attn.key_dim, attn.key_dim, attn.value_dim), dim=0)
-    copy_merged_column(attn.in_proj_qkvz.weight, [q, k, v, index.get_tensor(f"{prefix}.linear_attn.in_proj_z.weight")], rank, world_size)
-    copy_merged_column(attn.in_proj_ba.weight, [index.get_tensor(f"{prefix}.linear_attn.in_proj_b.weight"), index.get_tensor(f"{prefix}.linear_attn.in_proj_a.weight")], rank, world_size)
+    copy_merged_column(
+        attn.in_proj_qkvz.weight,
+        [q, k, v, index.get_tensor(f"{prefix}.linear_attn.in_proj_z.weight")],
+        rank,
+        world_size,
+    )
+    copy_merged_column(
+        attn.in_proj_ba.weight,
+        [
+            index.get_tensor(f"{prefix}.linear_attn.in_proj_b.weight"),
+            index.get_tensor(f"{prefix}.linear_attn.in_proj_a.weight"),
+        ],
+        rank,
+        world_size,
+    )
     conv_qkv = index.get_tensor(f"{prefix}.linear_attn.conv1d.weight")
     conv_parts = conv_qkv.split((attn.key_dim, attn.key_dim, attn.value_dim), dim=0)
     copy_merged_column(attn.conv1d_weight, list(conv_parts), rank, world_size)
@@ -539,7 +602,9 @@ def _save_full_attention(tensors: dict[str, torch.Tensor | None], attn: Qwen35Fu
     tensors[f"{prefix}.self_attn.k_norm.weight"] = rank0_tensor(attn.k_norm.weight - 1.0)
 
 
-def _save_full_attention_replicated_kv(tensors: dict[str, torch.Tensor | None], attn: Qwen35FullAttention, prefix: str) -> None:
+def _save_full_attention_replicated_kv(
+    tensors: dict[str, torch.Tensor | None], attn: Qwen35FullAttention, prefix: str
+) -> None:
     q_size, k_size, v_size = attn.qkv_proj.local_out_features
     q_gate = attn.qkv_proj.weight[:q_size]
     k = attn.qkv_proj.weight[q_size : q_size + k_size]
@@ -582,7 +647,9 @@ def _save_gated_delta_net(tensors: dict[str, torch.Tensor | None], attn: Qwen35G
     q_size, k_size, v_size, z_size = attn.in_proj_qkvz.local_out_features
     qkv = attn.in_proj_qkvz.weight[: q_size + k_size + v_size]
     z = attn.in_proj_qkvz.weight[q_size + k_size + v_size : q_size + k_size + v_size + z_size]
-    tensors[f"{prefix}.linear_attn.in_proj_qkv.weight"] = gather_tensor_parallel_split_column_tensor(qkv, [q_size, k_size, v_size])
+    tensors[f"{prefix}.linear_attn.in_proj_qkv.weight"] = gather_tensor_parallel_split_column_tensor(
+        qkv, [q_size, k_size, v_size]
+    )
     (z_weight,) = gather_tensor_parallel_column_tensors([z])
     tensors[f"{prefix}.linear_attn.in_proj_z.weight"] = z_weight
 
@@ -596,7 +663,9 @@ def _save_gated_delta_net(tensors: dict[str, torch.Tensor | None], attn: Qwen35G
     conv_q = attn.local_key_dim
     conv_k = attn.local_key_dim
     conv_v = attn.local_value_dim
-    tensors[f"{prefix}.linear_attn.conv1d.weight"] = gather_tensor_parallel_split_column_tensor(attn.conv1d_weight, [conv_q, conv_k, conv_v])
+    tensors[f"{prefix}.linear_attn.conv1d.weight"] = gather_tensor_parallel_split_column_tensor(
+        attn.conv1d_weight, [conv_q, conv_k, conv_v]
+    )
     tensors[f"{prefix}.linear_attn.dt_bias"] = gather_tensor_parallel_tensor(attn.dt_bias, dim=0)
     tensors[f"{prefix}.linear_attn.A_log"] = gather_tensor_parallel_tensor(attn.A_log, dim=0)
     tensors[f"{prefix}.linear_attn.norm.weight"] = rank0_tensor(attn.norm_weight)

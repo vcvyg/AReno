@@ -52,6 +52,7 @@ class _FakeInferenceManager(InferenceManager):
         self.ops.append(("decode", int(next_tokens.numel())))
         return next_tokens + 1, torch.zeros_like(next_tokens, dtype=torch.float32) - float(sample_step)
 
+
 def test_no_sync_rollout_continues_pending_prompts_beyond_running_slots():
     """A single rollout call should drain pending rows while respecting slot limits."""
 

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import importlib
 import pkgutil
-from typing import Callable, Protocol
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Protocol
 
-from areno.api.trainer_config import TrainerConfig
 from areno.api.loss_fns import dpo_loss_fn, grpo_loss_fn, gspo_loss_fn, ppo_loss_fn, sft_loss_fn
+from areno.api.trainer_config import TrainerConfig
 
 
 class TrainerFactory(Protocol):

@@ -14,6 +14,7 @@ expert-major layout consumed by ``areno_grouped_linear`` / the expert MLPs:
 Backward implementations re-use the inverse kernels so gradients are routed
 through the same indirection tensors saved in the forward pass.
 """
+
 import torch
 
 from areno.accel._extension import extension as _extension
@@ -23,7 +24,9 @@ class _MoePermute(torch.autograd.Function):
     """Autograd glue for routing-map driven MoE permute."""
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor, num_out_tokens: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        ctx, x: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor, num_out_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         out, route_weight, token_index = _extension().areno_moe_permute_forward(
             x.contiguous(),
             probs.contiguous(),
@@ -36,7 +39,9 @@ class _MoePermute(torch.autograd.Function):
         return out, route_weight, token_index
 
     @staticmethod
-    def backward(ctx, grad_out: torch.Tensor, grad_route_weight: torch.Tensor, grad_token_index: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+    def backward(
+        ctx, grad_out: torch.Tensor, grad_route_weight: torch.Tensor, grad_token_index: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
         del grad_route_weight, grad_token_index
         (token_index,) = ctx.saved_tensors
         grad_x = _extension().areno_moe_unpermute_forward(grad_out.contiguous(), token_index, ctx.tokens, ctx.hidden)
@@ -95,7 +100,9 @@ class _MoeUnpermute(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, token_index: torch.Tensor, tokens: int, hidden: int) -> torch.Tensor:
         ctx.save_for_backward(token_index)
-        return _extension().areno_moe_unpermute_forward(x.contiguous(), token_index.contiguous(), int(tokens), int(hidden))
+        return _extension().areno_moe_unpermute_forward(
+            x.contiguous(), token_index.contiguous(), int(tokens), int(hidden)
+        )
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
@@ -104,7 +111,9 @@ class _MoeUnpermute(torch.autograd.Function):
 
 
 @torch._dynamo.disable
-def areno_moe_permute(x: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor, num_out_tokens: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def areno_moe_permute(
+    x: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor, num_out_tokens: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Permute MoE tokens in expert-major order and return route weights plus source token ids.
 
     ``x`` shape: ``(tokens, hidden)``. ``routing_map`` shape:

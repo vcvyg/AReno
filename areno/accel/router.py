@@ -7,6 +7,7 @@ those groups using sigmoid scores plus a learned ``expert_bias`` adjustment.
 The kernel returns both the expert indices and their normalized routing
 weights ready for the permute / grouped-GEMM pipeline.
 """
+
 import torch
 
 from areno.accel._extension import extension as _extension

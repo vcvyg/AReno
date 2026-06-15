@@ -26,8 +26,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, Field
-
 from areno.api.openai_chat import (
     build_chat_completion_response,
     first_user_text,
@@ -80,7 +78,7 @@ class AgentBatch:
         return len(self.records) * self.n_samples
 
     @classmethod
-    def from_prompt_batch(cls, prompt_batch, n_samples: int) -> "AgentBatch":
+    def from_prompt_batch(cls, prompt_batch, n_samples: int) -> AgentBatch:
         """Build an agent batch from the trainer's tokenized prompt batch."""
 
         return cls(
@@ -93,7 +91,9 @@ class AgentBatch:
     def iter_samples(self) -> Iterator[AgentItem]:
         """Yield one item per prompt/sample pair in stable row order."""
 
-        for prompt_index, (record, prompt, input_tokens) in enumerate(zip(self.records, self.prompts, self.input_tokens, strict=True)):
+        for prompt_index, (record, prompt, input_tokens) in enumerate(
+            zip(self.records, self.prompts, self.input_tokens, strict=True)
+        ):
             for sample_index in range(self.n_samples):
                 yield AgentItem(
                     record=record,
@@ -241,7 +241,7 @@ class RolloutSession:
         self,
         trainer,
         *,
-        sampling_params: "SamplingParams",
+        sampling_params: SamplingParams,
         loss_mask_policy: LossMaskPolicy | None = None,
         max_running_prompts: int | None = None,
         timeout_s: float = 300.0,
@@ -252,7 +252,9 @@ class RolloutSession:
         self._loss_mask_policy = loss_mask_policy or LossMaskPolicy()
         self._tool_call_parser = get_tool_call_parser(infer_tool_call_parser_name(trainer))
         self._dp_size = max(_trainer_dp_size(trainer), 1)
-        self._max_running_prompts = max(1, int(max_running_prompts)) if max_running_prompts is not None else self._dp_size
+        self._max_running_prompts = (
+            max(1, int(max_running_prompts)) if max_running_prompts is not None else self._dp_size
+        )
         self._local_max_running_prompts = max(_ceil_div(self._max_running_prompts, self._dp_size), 1)
         self._timeout_s = float(timeout_s)
         self._server: ThreadingHTTPServer | None = None
@@ -268,7 +270,7 @@ class RolloutSession:
 
         return self._max_running_prompts
 
-    async def __aenter__(self) -> "RolloutSession":
+    async def __aenter__(self) -> RolloutSession:
         """Start the local proxy."""
 
         self._loop = asyncio.get_running_loop()
@@ -445,7 +447,11 @@ class RolloutSession:
         messages = _normalize_messages(body.get("messages") or [])
         tools = list(body.get("tools") or [])
         tool_choice = body.get("tool_choice")
-        params = self._sampling_params.model_copy() if hasattr(self._sampling_params, "model_copy") else self._sampling_params.copy()
+        params = (
+            self._sampling_params.model_copy()
+            if hasattr(self._sampling_params, "model_copy")
+            else self._sampling_params.copy()
+        )
         if body.get("max_tokens") is not None:
             params.max_new_tokens = int(body["max_tokens"])
         if body.get("temperature") is not None:
@@ -467,7 +473,7 @@ class RolloutSession:
             raise RuntimeError("agent rollout proxy is not running")
         try:
             await asyncio.wait_for(asyncio.shield(self._run_chat_request(pending)), timeout=self._timeout_s)
-        except asyncio.TimeoutError as exc:
+        except asyncio.TimeoutError:
             pending.cancelled = True
             raise TimeoutError("agent rollout proxy timed out waiting for completion")
         if pending.error is not None:
@@ -559,7 +565,11 @@ class RolloutSession:
         tool_parse = self._tool_call_parser.parse(content, pending.tools, pending.tool_choice)
         response_kind = "assistant_tool_call" if tool_parse.tool_calls else _response_kind(content)
         events = [
-            RewardEvent(type="assistant_tool_call", name=tool_call["function"]["name"], arguments=tool_call["function"]["arguments"])
+            RewardEvent(
+                type="assistant_tool_call",
+                name=tool_call["function"]["name"],
+                arguments=tool_call["function"]["arguments"],
+            )
             for tool_call in tool_parse.tool_calls
         ]
         if not events:
@@ -578,7 +588,9 @@ class RolloutSession:
             response_logprobs=response.response_logprobs,
             trace=trace,
             response_kind=response_kind,
-            loss_mask_override=_tool_call_loss_mask(tokenizer, response.response_tokens) if tool_parse.tool_calls else None,
+            loss_mask_override=_tool_call_loss_mask(tokenizer, response.response_tokens)
+            if tool_parse.tool_calls
+            else None,
         )
         # The prompt tokens are the fully rendered chat context for this turn,
         # including prior assistant/tool messages. Those context tokens are
@@ -604,7 +616,11 @@ class RolloutSession:
         old_response_kind = existing.response_kind
         old_response_len = len(existing.response_tokens)
         if new_sample.response_text:
-            existing.response_text = f"{existing.response_text}\n{new_sample.response_text}" if existing.response_text else new_sample.response_text
+            existing.response_text = (
+                f"{existing.response_text}\n{new_sample.response_text}"
+                if existing.response_text
+                else new_sample.response_text
+            )
             existing.last_response_text = new_sample.response_text
         existing.response_tokens.extend(new_sample.response_tokens)
         existing.response_logprobs.extend(new_sample.response_logprobs)
@@ -686,7 +702,9 @@ def load_agent_run_fn(path: str) -> Callable[[RolloutSession, AgentBatch], Any]:
     return run_agent
 
 
-def _messages_to_prompt_tokens(tokenizer, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None, fallback_prompt: str) -> list[int]:
+def _messages_to_prompt_tokens(
+    tokenizer, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None, fallback_prompt: str
+) -> list[int]:
     return messages_to_prompt_tokens(tokenizer, messages, tools=tools, fallback_prompt=fallback_prompt)
 
 

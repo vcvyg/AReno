@@ -12,18 +12,18 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-import torch
 import click
+import torch
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from areno.cli.model_refs import resolve_model_ref
 from areno.api.openai_chat import build_chat_completion_response, messages_to_prompt_tokens
 from areno.api.tool_call_parser import ToolCallParser, get_tool_call_parser, infer_tool_call_parser_name
+from areno.cli.model_refs import resolve_model_ref
+from areno.engine import ArenoEngine
 from areno.engine.config import RuntimeConfig
 from areno.engine.data import SamplingParams
 from areno.engine.data.tokenizer import load_tokenizer
-from areno.engine import ArenoEngine
 
 
 def _serve_loss_fn(*_: Any) -> torch.Tensor:
@@ -313,7 +313,9 @@ def _set_future_result(future: asyncio.Future, response: ChatCompletionResponse)
         future.set_result(response)
 
 
-async def _await_pending_response(state: ServeState, raw_request: Request, item: PendingRequest) -> ChatCompletionResponse:
+async def _await_pending_response(
+    state: ServeState, raw_request: Request, item: PendingRequest
+) -> ChatCompletionResponse:
     """Wait for `item.future`, run a disconnect watcher in parallel, and return the response.
 
     Uses `asyncio.shield` so a cancelled awaiter (e.g. client gone) does not
@@ -366,7 +368,9 @@ def _build_response(
     finish_reasons: list[str],
 ) -> ChatCompletionResponse:
     """Thin shim that forwards to `_build_response_from` using state's tokenizer/model_path."""
-    return _build_response_from(state.tokenizer, state.model_path, state.tool_call_parser, request, prompt, response_ids, finish_reasons)
+    return _build_response_from(
+        state.tokenizer, state.model_path, state.tool_call_parser, request, prompt, response_ids, finish_reasons
+    )
 
 
 def _build_response_from(
@@ -394,7 +398,9 @@ def _build_response_from(
     return ChatCompletionResponse(**data)
 
 
-def _encode_messages(tokenizer: Any, messages: list[ChatMessage], *, tools: list[dict[str, Any]] | None = None) -> list[int]:
+def _encode_messages(
+    tokenizer: Any, messages: list[ChatMessage], *, tools: list[dict[str, Any]] | None = None
+) -> list[int]:
     """Tokenise a chat history, using the tokenizer's chat template when available."""
     payload = [_chat_message_payload(msg) for msg in messages]
     return messages_to_prompt_tokens(tokenizer, payload, tools=tools, fallback_prompt=_messages_fallback_text(payload))
@@ -470,9 +476,21 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str]:
 @click.option("--world-size", type=int, default=1, show_default=True, help="Total number of local worker ranks.")
 @click.option("--host", default="0.0.0.0", show_default=True, help="HTTP bind host.")
 @click.option("--port", type=int, default=8000, show_default=True, help="HTTP bind port.")
-@click.option("--max-running-prompts", type=int, default=128, show_default=True, help="Maximum concurrent rollout prompts per request chunk.")
+@click.option(
+    "--max-running-prompts",
+    type=int,
+    default=128,
+    show_default=True,
+    help="Maximum concurrent rollout prompts per request chunk.",
+)
 @click.option("--default-max-tokens", type=int, default=1024, show_default=True, help="Default max generated tokens.")
-@click.option("--decode-progress-interval-s", type=float, default=0.0, show_default=True, help="Worker decode progress log interval.")
+@click.option(
+    "--decode-progress-interval-s",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Worker decode progress log interval.",
+)
 @click.option("--eager-decode", is_flag=True, help="Run decode in eager mode instead of CUDA graph replay.")
 def serve_command(
     model_path: str,

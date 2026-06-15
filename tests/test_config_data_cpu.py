@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import tempfile
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
 
 import torch
 
+from areno.api.data import PromptBatch, PromptItem
+from areno.api.trainer_config import RolloutTrainerConfig, TrainerConfig
 from areno.cli import train as train_cli
 from areno.engine.config import EngineConfig, ModelConfig, RuntimeConfig, _parse_dtype
 from areno.engine.data import to_cpu, to_device
-from areno.api.data import PromptBatch, PromptItem
-from areno.api.trainer_config import RolloutTrainerConfig, TrainerConfig
 
 
 class ConfigAndDataTest(unittest.TestCase):

@@ -60,7 +60,9 @@ class SFTTrainer:
             for train_batch in self._iter_train_batches(tokenizer, max_seq_len=max_seq_len):
                 if not train_batch:
                     continue
-                self.logger.info("epoch=%d step=%d role=policy stage=train_start rows=%d", epoch, step, len(train_batch))
+                self.logger.info(
+                    "epoch=%d step=%d role=policy stage=train_start rows=%d", epoch, step, len(train_batch)
+                )
                 train_start = time.perf_counter()
                 # The backend computes next-token logprobs for the supplied
                 # labels; `sft_loss_fn` selects only response/target positions
@@ -127,7 +129,9 @@ def _record_to_train_sequence(record: Any, tokenizer, *, max_seq_len: int):
         tokens, prompt_mask = _messages_to_tokens_and_mask(record["messages"], tokenizer)
     elif "prompt" in record and "response" in record:
         # Prompt/response style rows train on the response suffix.
-        tokens, prompt_mask = prompt_response_to_tokens_and_mask(record["prompt"], record["response"], tokenizer, eos_token_id)
+        tokens, prompt_mask = prompt_response_to_tokens_and_mask(
+            record["prompt"], record["response"], tokenizer, eos_token_id
+        )
     elif isinstance(record.get("text"), str):
         # Plain text rows train on every token after the first context token.
         tokens = tokenizer.encode(record["text"], add_special_tokens=True)

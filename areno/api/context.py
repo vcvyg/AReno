@@ -7,10 +7,18 @@ and a monotonic global step counter owned by the high-level `Trainer`.
 
 from areno.api.config import BackendConfig
 
+
 class Context:
     """Shared immutable-ish runtime context passed into backend calls."""
 
-    def __init__(self, world_size, model_path: str, tokenizer, custom_config: BackendConfig | None = None, eos_token_ids: tuple[int, ...] = ()):
+    def __init__(
+        self,
+        world_size,
+        model_path: str,
+        tokenizer,
+        custom_config: BackendConfig | None = None,
+        eos_token_ids: tuple[int, ...] = (),
+    ):
         """Store model path, tokenizer, world size, config, and EOS ids.
 
         `global_step` starts at -1 so the first training iteration produces

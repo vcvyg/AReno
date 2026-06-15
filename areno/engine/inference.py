@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import threading
 import time
 from collections.abc import Callable
@@ -21,14 +20,18 @@ from areno.engine.data.sampling import (
     _stop_token_ids,
     _truncate_generated,
 )
-from areno.engine.protocol import RolloutPayload
 from areno.engine.parallel.collectives import broadcast_object, broadcast_tensor
 from areno.engine.parallel.context import get_tp_context
+from areno.engine.protocol import RolloutPayload
 from areno.engine.runtime.common import _check_token_ids, _device_long
-from areno.engine.runtime.decode_graph import DecodeGraph, bucket_for, has_graph_capture_memory, sync_before_graph_capture
+from areno.engine.runtime.decode_graph import (
+    DecodeGraph,
+    bucket_for,
+    has_graph_capture_memory,
+    sync_before_graph_capture,
+)
 from areno.engine.runtime.metadata import InferMeta
 from areno.engine.runtime.rollout import _empty_rollout
-
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +88,7 @@ class PrefillPayload:
         eos_token_id: int | tuple[int, ...] | None,
         sample_generator: torch.Generator | None,
         return_logprobs: bool,
-    ) -> "PrefillPayload":
+    ) -> PrefillPayload:
         """Attach sampling fields to the runtime prefill tensor bundle."""
 
         return cls(
@@ -288,15 +291,23 @@ class InferenceManager:
         progress_key = id(state)
         sample_generator = _make_sample_generator(sampling_params, self.device)
         stop_token_ids = _stop_token_ids(sampling_params, eos_token_id)
-        stop_token_tensor = torch.tensor(stop_token_ids, device=self.device, dtype=torch.long) if stop_token_ids else None
+        stop_token_tensor = (
+            torch.tensor(stop_token_ids, device=self.device, dtype=torch.long) if stop_token_ids else None
+        )
         cancel_token = _cancel_stop_token(stop_token_ids, eos_token_id)
         # When stop tokens exist, cancellation injects one of them; otherwise
         # we still need *something* recognisable downstream as "stop".
-        truncate_stop_token_ids = stop_token_ids if stop_token_ids else ([cancel_token] if cancel_flags is not None else [])
+        truncate_stop_token_ids = (
+            stop_token_ids if stop_token_ids else ([cancel_token] if cancel_flags is not None else [])
+        )
         prompt_indices_list = list(prompt_indices) if prompt_indices is not None else list(range(prompt_count))
         # Convert per-DP cancel-index list into a tensor on CPU so the engine
         # can mutate the underlying shared memory between decode steps.
-        cancel_indices_tensor = torch.tensor(cancel_indices, dtype=torch.long) if cancel_flags is not None and cancel_indices is not None else None
+        cancel_indices_tensor = (
+            torch.tensor(cancel_indices, dtype=torch.long)
+            if cancel_flags is not None and cancel_indices is not None
+            else None
+        )
 
         # generated/logprobs shape: (prompt_count, max_new_tokens), with only
         # the prefix [0:response_lens[i]] valid for row i.
@@ -354,7 +365,17 @@ class InferenceManager:
                 tuple(truncate_stop_token_ids),
             )
             if admitted is not None:
-                generated, logprobs, response_lens, next_tokens, cache_seqlens, position_ids, block_table, active_rows, active_count = admitted
+                (
+                    generated,
+                    logprobs,
+                    response_lens,
+                    next_tokens,
+                    cache_seqlens,
+                    position_ids,
+                    block_table,
+                    active_rows,
+                    active_count,
+                ) = admitted
             cancelled = self._cancel_mask_for_active_rows(active_rows, cancel_flags, cancel_indices_tensor)
             if cancelled is not None:
                 generated[active_rows[cancelled], 0] = cancel_token
@@ -495,10 +516,14 @@ class InferenceManager:
         finish_reason_obj = None
         if ctx.is_rank0:
             response_lengths = response_lens.detach().cpu().tolist()
-            generated_rows = [row[: int(length)] for row, length in zip(generated.cpu().tolist(), response_lengths, strict=True)]
+            generated_rows = [
+                row[: int(length)] for row, length in zip(generated.cpu().tolist(), response_lengths, strict=True)
+            ]
             generated_obj, finish_reason_obj = _truncate_generated(generated_rows, truncate_stop_token_ids)
             logprobs_rows = logprobs.cpu().tolist()
-            logprobs_obj = [row[: len(generated_row)] for row, generated_row in zip(logprobs_rows, generated_obj, strict=True)]
+            logprobs_obj = [
+                row[: len(generated_row)] for row, generated_row in zip(logprobs_rows, generated_obj, strict=True)
+            ]
         # broadcast_object src=0 of the TP group: rank 0 holds the canonical
         # rollout output; other TP ranks adopt the same lists so state is
         # consistent at the engine boundary.
@@ -533,7 +558,9 @@ class InferenceManager:
             torch.cat([response_lens, response_lens_extra], dim=0),
         )
 
-    def _ensure_decode_kv_blocks(self, state: InferenceBatchState, active_rows: torch.Tensor, cache_seqlens: torch.Tensor) -> None:
+    def _ensure_decode_kv_blocks(
+        self, state: InferenceBatchState, active_rows: torch.Tensor, cache_seqlens: torch.Tensor
+    ) -> None:
         """Ensure every active row has a paged-KV block for the next decode token."""
 
         if active_rows.numel() == 0:
@@ -651,7 +678,20 @@ class InferenceManager:
         stop_token_tensor: torch.Tensor | None,
         finished_callback: FinishedRowsCallback | None,
         truncate_stop_token_ids: tuple[int, ...],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
+    ) -> (
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            int,
+        ]
+        | None
+    ):
         """Admit pending rows and run chunked prefill until rows become decodable."""
 
         while True:
@@ -670,14 +710,26 @@ class InferenceManager:
             if new_rows.numel() == 0:
                 self._run_prefill_payload(prefill)
                 if active_count > 0:
-                    return generated, logprobs, response_lens, next_tokens, cache_seqlens, position_ids, block_table, active_rows, active_count
+                    return (
+                        generated,
+                        logprobs,
+                        response_lens,
+                        next_tokens,
+                        cache_seqlens,
+                        position_ids,
+                        block_table,
+                        active_rows,
+                        active_count,
+                    )
                 continue
             new_tokens, new_logprobs = self._infer_next_token_tensor(prefill)
             break
         generated[new_rows, 0] = new_tokens
         logprobs[new_rows, 0] = new_logprobs
         response_lens[new_rows] = 1
-        new_cache_seqlens = torch.tensor([len(state.prompts[int(row)]) for row in new_rows.tolist()], device=self.device, dtype=torch.int32)
+        new_cache_seqlens = torch.tensor(
+            [len(state.prompts[int(row)]) for row in new_rows.tolist()], device=self.device, dtype=torch.int32
+        )
         new_position_ids = new_cache_seqlens.to(torch.long)
         new_block_table = prefill.block_table.to(self.device, non_blocking=True).int()
         remove = torch.zeros(int(new_rows.numel()), device=self.device, dtype=torch.bool)
@@ -719,7 +771,17 @@ class InferenceManager:
             new_block_table = new_block_table[keep]
         if new_rows.numel() == 0:
             if active_count > 0:
-                return generated, logprobs, response_lens, next_tokens, cache_seqlens, position_ids, block_table, active_rows, active_count
+                return (
+                    generated,
+                    logprobs,
+                    response_lens,
+                    next_tokens,
+                    cache_seqlens,
+                    position_ids,
+                    block_table,
+                    active_rows,
+                    active_count,
+                )
             return (
                 generated,
                 logprobs,
@@ -738,8 +800,28 @@ class InferenceManager:
             block_table = torch.cat([block_table[:active_count], new_block_table], dim=0)
             active_rows = torch.cat([active_rows[:active_count], new_rows], dim=0)
             active_count = int(active_rows.numel())
-            return generated, logprobs, response_lens, next_tokens, cache_seqlens, position_ids, block_table, active_rows, active_count
-        return generated, logprobs, response_lens, new_tokens, new_cache_seqlens, new_position_ids, new_block_table, new_rows, int(new_rows.numel())
+            return (
+                generated,
+                logprobs,
+                response_lens,
+                next_tokens,
+                cache_seqlens,
+                position_ids,
+                block_table,
+                active_rows,
+                active_count,
+            )
+        return (
+            generated,
+            logprobs,
+            response_lens,
+            new_tokens,
+            new_cache_seqlens,
+            new_position_ids,
+            new_block_table,
+            new_rows,
+            int(new_rows.numel()),
+        )
 
     @torch.inference_mode()
     def _run_prefill_payload(self, payload: PrefillPayload) -> None:
@@ -779,7 +861,6 @@ class InferenceManager:
         TP rank 0 so every shard agrees on the chosen ids.
         """
         sample_indices = _device_long(payload.sample_indices, self.device)
-        num_tokens = int(payload.input_ids.numel())
         # Add a leading batch dim of 1 — prefill packs all prompts into one
         # contiguous (sum_seq_lens,) tensor that the model expects as (1, T).
         input_ids = _device_long(payload.input_ids, self.device).unsqueeze(0)
@@ -943,7 +1024,9 @@ class InferenceManager:
         ctx = get_tp_context()
         # User-configured buckets clamped to [1, max_running_seqs], plus the
         # max so the largest active batch always has a graph.
-        buckets = sorted({bucket for bucket in self.config.runtime.decode_graph_buckets if 1 <= bucket <= self._infer_batch_size})
+        buckets = sorted(
+            {bucket for bucket in self.config.runtime.decode_graph_buckets if 1 <= bucket <= self._infer_batch_size}
+        )
         buckets.append(self._infer_batch_size)
         for bucket in sorted(set(buckets)):
             if bucket in self._decode_graphs or bucket in self._decode_graph_skipped_buckets:

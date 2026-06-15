@@ -25,7 +25,6 @@ from areno.engine.checkpoints.common import (
     TopLevelSpec,
 )
 
-
 # Vocab embedding lives directly under model.embed_tokens (no extra wrapper).
 TOP_LEVEL_SPEC = TopLevelSpec(embedding_key="model.embed_tokens.weight", embedding_attr="embed_tokens")
 # Per-layer RMSNorm weights are replicated across TP ranks.
@@ -54,8 +53,12 @@ QKV_BIAS_SPEC = OptionalMergedColumnSpec(
 )
 # Save side: reverse the merge using the per-output-section sizes stored on the
 # linear layer so we recover the original q/k/v split widths.
-QKV_SAVE_SPEC = RangedSplitColumnSpec(src_attr="self_attn.qkv_proj.weight", size_attr="self_attn.qkv_proj.local_out_features", keys=QKV_WEIGHT_SPEC.keys)
-QKV_BIAS_SAVE_SPEC = OptionalRangedSplitColumnSpec(src_attr="self_attn.qkv_proj.bias", size_attr="self_attn.qkv_proj.local_out_features", keys=QKV_BIAS_SPEC.keys)
+QKV_SAVE_SPEC = RangedSplitColumnSpec(
+    src_attr="self_attn.qkv_proj.weight", size_attr="self_attn.qkv_proj.local_out_features", keys=QKV_WEIGHT_SPEC.keys
+)
+QKV_BIAS_SAVE_SPEC = OptionalRangedSplitColumnSpec(
+    src_attr="self_attn.qkv_proj.bias", size_attr="self_attn.qkv_proj.local_out_features", keys=QKV_BIAS_SPEC.keys
+)
 # Output projection is RowParallelLinear -> dim=1 sharded (input dim).
 ATTN_ROW_SPEC = ParallelTensorSpec("{prefix}.self_attn.o_proj.weight", "self_attn.o_proj.weight", 1)
 # Qwen3 adds optional per-head RMSNorm on Q and K (qk_layernorm=True).
@@ -66,7 +69,9 @@ GATE_UP_WEIGHT_SPEC = MergedColumnSpec(
     dst_attr="mlp.gate_up_proj.weight",
     keys=("{prefix}.mlp.gate_proj.weight", "{prefix}.mlp.up_proj.weight"),
 )
-GATE_UP_SAVE_SPEC = SplitColumnSpec(src_attr="mlp.gate_up_proj.weight", size_attr="mlp.gate_up_proj.local_out_features", keys=GATE_UP_WEIGHT_SPEC.keys)
+GATE_UP_SAVE_SPEC = SplitColumnSpec(
+    src_attr="mlp.gate_up_proj.weight", size_attr="mlp.gate_up_proj.local_out_features", keys=GATE_UP_WEIGHT_SPEC.keys
+)
 MLP_ROW_SPEC = ParallelTensorSpec("{prefix}.mlp.down_proj.weight", "mlp.down_proj.weight", 1)
 MOE_SPEC = MoeSpec(
     gate_weight_key="{prefix}.gate.weight",

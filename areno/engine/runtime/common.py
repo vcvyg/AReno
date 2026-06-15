@@ -25,7 +25,9 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def pad_rows(rows: list[Any], *, dtype: torch.dtype, fill_value: int | float | bool = 0, width: int | None = None) -> torch.Tensor:
+def pad_rows(
+    rows: list[Any], *, dtype: torch.dtype, fill_value: int | float | bool = 0, width: int | None = None
+) -> torch.Tensor:
     """Pad variable-length 1D rows into a rectangular CPU tensor."""
 
     if width is None:
@@ -47,8 +49,7 @@ def pad_rollout_rows(
 
     input_rows = [prompt + response for prompt, response in zip(prompt_ids, response_ids, strict=True)]
     response_mask_rows = [
-        ([0] * len(prompt)) + ([1] * len(response))
-        for prompt, response in zip(prompt_ids, response_ids, strict=True)
+        ([0] * len(prompt)) + ([1] * len(response)) for prompt, response in zip(prompt_ids, response_ids, strict=True)
     ]
     if logprob_rows is None:
         logprob_rows = [[] for _ in response_ids]

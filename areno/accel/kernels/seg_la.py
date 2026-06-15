@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Segmented Linear Attention (seg-LA) Triton kernels.
 
@@ -36,13 +35,12 @@ skip the load/store mask construction, which speeds up the tight inner loop
 materially.
 """
 
-from typing import Optional
-import math
+from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
-from dataclasses import dataclass
+
 
 # arg `meta` of `seg_la_fwd` is SegLaMeta
 @dataclass
@@ -58,6 +56,7 @@ class SegLaMeta:
     zero-initialised inside the kernel) or 1 for continuation chunks (state
     loaded from ``S``).
     """
+
     batch_size: int  # batch size, num of requests
     max_q_length: int  # max(seq_lens)
     q_offsets: torch.Tensor  # [bs+1], query_start_locations,
@@ -68,7 +67,7 @@ class SegLaMeta:
     q_offsets_stride: int = 0
     s_scales_stride: int = 0
     decay_scales_stride: int = 0
-    mask: Optional[torch.Tensor] = None  # Currently not supported
+    mask: torch.Tensor | None = None  # Currently not supported
 
 
 # fused
@@ -136,33 +135,13 @@ def seg_la_kernel(
     # Pointer setup. q_offset addresses the request's row in the packed
     # (sum_l, heads, head_dim) layout; hid * HEAD_DIM selects this head.
     # offs_b broadcasts over rows via stride_q (the per-token stride).
-    q_ptrs = (
-        Q
-        + q_offset * stride_q
-        + hid * HEAD_DIM
-        + (offs_b[:, None] * stride_q + offs_d[None, :])
-    )
-    k_ptrs = (
-        K
-        + q_offset * stride_k
-        + hid * HEAD_DIM
-        + (offs_b[:, None] * stride_k + offs_d[None, :])
-    )
+    q_ptrs = Q + q_offset * stride_q + hid * HEAD_DIM + (offs_b[:, None] * stride_q + offs_d[None, :])
+    k_ptrs = K + q_offset * stride_k + hid * HEAD_DIM + (offs_b[:, None] * stride_k + offs_d[None, :])
     # V and Out additionally use sid * SPLIT_DIM to take this program's
     # value-dim split (V is the dimension we parallelise over for occupancy).
-    v_ptrs = (
-        V
-        + q_offset * stride_v
-        + hid * HEAD_DIM
-        + sid * SPLIT_DIM
-        + (offs_b[:, None] * stride_v + offs_s[None, :])
-    )
+    v_ptrs = V + q_offset * stride_v + hid * HEAD_DIM + sid * SPLIT_DIM + (offs_b[:, None] * stride_v + offs_s[None, :])
     out_ptrs = (
-        Out
-        + q_offset * stride_o
-        + hid * HEAD_DIM
-        + sid * SPLIT_DIM
-        + (offs_b[:, None] * stride_o + offs_s[None, :])
+        Out + q_offset * stride_o + hid * HEAD_DIM + sid * SPLIT_DIM + (offs_b[:, None] * stride_o + offs_s[None, :])
     )
     # State layout: (slots, heads, HEAD_DIM, HEAD_DIM). For each slot, head we
     # load the (HEAD_DIM, SPLIT_DIM) slice owned by this program.
@@ -362,26 +341,14 @@ def seg_la_p_kernel(
     # Q/K addressing: ``kid * K_SPLIT_DIM`` picks this program's K-stripe
     # of the head's QK dimension.
     q_ptrs = (
-        Q
-        + q_offset * stride_q
-        + hid * HEAD_DIM
-        + kid * K_SPLIT_DIM
-        + (offs_b[:, None] * stride_q + offs_k[None, :])
+        Q + q_offset * stride_q + hid * HEAD_DIM + kid * K_SPLIT_DIM + (offs_b[:, None] * stride_q + offs_k[None, :])
     )
     k_ptrs = (
-        K
-        + q_offset * stride_k
-        + hid * HEAD_DIM
-        + kid * K_SPLIT_DIM
-        + (offs_b[:, None] * stride_k + offs_k[None, :])
+        K + q_offset * stride_k + hid * HEAD_DIM + kid * K_SPLIT_DIM + (offs_b[:, None] * stride_k + offs_k[None, :])
     )
     # V uses ``vid * V_SPLIT_DIM`` along the V-side dim.
     v_ptrs = (
-        V
-        + q_offset * stride_v
-        + hid * HEAD_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_b[:, None] * stride_v + offs_v[None, :])
+        V + q_offset * stride_v + hid * HEAD_DIM + vid * V_SPLIT_DIM + (offs_b[:, None] * stride_v + offs_v[None, :])
     )
     # Output is laid out (k_dim_block, length, qo_heads, d) so each kid
     # writes into its own slab; later the slabs are summed to produce the
@@ -426,9 +393,7 @@ def seg_la_p_kernel(
             # Tail block: ``b`` may be < BLOCK. Negative b_offs (past valid
             # length) get masked to 0 so they don't contribute to the
             # outer-product update.
-            q = tl.load(
-                q_ptrs + n * stride_q, mask=(n + offs_b)[:, None] < q_length, other=0.0
-            ).to(tl.float32)
+            q = tl.load(q_ptrs + n * stride_q, mask=(n + offs_b)[:, None] < q_length, other=0.0).to(tl.float32)
             k = tl.trans(
                 tl.load(
                     k_ptrs + n * stride_k,
@@ -436,9 +401,7 @@ def seg_la_p_kernel(
                     other=0.0,
                 )
             ).to(tl.float32)
-            v = tl.load(
-                v_ptrs + n * stride_v, mask=(n + offs_b)[:, None] < q_length, other=0.0
-            ).to(tl.float32)
+            v = tl.load(v_ptrs + n * stride_v, mask=(n + offs_b)[:, None] < q_length, other=0.0).to(tl.float32)
             b = min(BLOCK, q_length - n)
             b_offs = b - 1 - offs_b
             block_decays = tl.exp(decay_scale * b_offs)
@@ -542,25 +505,13 @@ def seg_la_s_kernel(
     # Same pointer scheme as prefill kernel; see seg_la_p_kernel for layout
     # notes. No ``n`` offset — the entire candidate window is in one block.
     q_ptrs = (
-        Q
-        + q_offset * stride_q
-        + hid * HEAD_DIM
-        + kid * K_SPLIT_DIM
-        + (offs_b[:, None] * stride_q + offs_k[None, :])
+        Q + q_offset * stride_q + hid * HEAD_DIM + kid * K_SPLIT_DIM + (offs_b[:, None] * stride_q + offs_k[None, :])
     )
     k_ptrs = (
-        K
-        + q_offset * stride_k
-        + hid * HEAD_DIM
-        + kid * K_SPLIT_DIM
-        + (offs_b[:, None] * stride_k + offs_k[None, :])
+        K + q_offset * stride_k + hid * HEAD_DIM + kid * K_SPLIT_DIM + (offs_b[:, None] * stride_k + offs_k[None, :])
     )
     v_ptrs = (
-        V
-        + q_offset * stride_v
-        + hid * HEAD_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_b[:, None] * stride_v + offs_v[None, :])
+        V + q_offset * stride_v + hid * HEAD_DIM + vid * V_SPLIT_DIM + (offs_b[:, None] * stride_v + offs_v[None, :])
     )
     # (num_dim_block, length, qo_heads, d)
     out_ptrs = (
@@ -590,10 +541,7 @@ def seg_la_s_kernel(
         # Load the (BLOCK x BLOCK) speculative mask — typically a tree mask
         # where row i has 1s for the ancestors of candidate i.
         mask = tl.load(
-            Mask
-            + bid * BLOCK * BLOCK
-            + tl.arange(0, BLOCK)[:, None] * BLOCK
-            + tl.arange(0, BLOCK)[None, :]
+            Mask + bid * BLOCK * BLOCK + tl.arange(0, BLOCK)[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
         ).to(tl.int32)
         # Each row's sum is the candidate's depth in the tree (= its position
         # in the resulting sequence). max_pos is the longest path.
@@ -610,12 +558,8 @@ def seg_la_s_kernel(
         k = tl.trans(tl.load(k_ptrs, mask=offs_b[:, None] < q_length)).to(tl.float32)
         v = tl.load(v_ptrs, mask=offs_b[:, None] < q_length).to(tl.float32)
         mask = tl.load(
-            Mask
-            + bid * q_length * q_length
-            + tl.arange(0, BLOCK)[:, None] * q_length
-            + tl.arange(0, BLOCK)[None, :],
-            mask=(tl.arange(0, BLOCK)[:, None] < q_length)
-            & (tl.arange(0, BLOCK)[None, :] < q_length),
+            Mask + bid * q_length * q_length + tl.arange(0, BLOCK)[:, None] * q_length + tl.arange(0, BLOCK)[None, :],
+            mask=(tl.arange(0, BLOCK)[:, None] < q_length) & (tl.arange(0, BLOCK)[None, :] < q_length),
         ).to(tl.int32)
         positions = tl.sum(mask, 1) - 1
         max_pos = tl.max(positions)
@@ -697,14 +641,7 @@ def seg_la_d_kernel(
     k_ptrs = K + bid * stride_k + hid * HEAD_DIM + kid * K_SPLIT_DIM + (offs_k)
     v_ptrs = V + bid * stride_v + hid * HEAD_DIM + vid * V_SPLIT_DIM + (offs_v)
     # (num_dim_block, length, qo_heads, d)
-    out_ptrs = (
-        Out
-        + kid * stride_o
-        + bid * H * HEAD_DIM
-        + hid * HEAD_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_v)
-    )
+    out_ptrs = Out + kid * stride_o + bid * H * HEAD_DIM + hid * HEAD_DIM + vid * V_SPLIT_DIM + (offs_v)
     # State tile this program owns: (K_SPLIT_DIM, V_SPLIT_DIM).
     s_ptrs = (
         S
@@ -791,14 +728,7 @@ def seg_la_mtp_kernel(
     # Output layout same as decode but with stride ``H * HEAD_DIM`` between
     # consecutive predicted steps.
     # (num_dim_block, length, qo_heads, d)
-    out_ptrs = (
-        Out
-        + kid * stride_o
-        + bid * step * H * HEAD_DIM
-        + hid * HEAD_DIM
-        + vid * V_SPLIT_DIM
-        + (offs_v)
-    )
+    out_ptrs = Out + kid * stride_o + bid * step * H * HEAD_DIM + hid * HEAD_DIM + vid * V_SPLIT_DIM + (offs_v)
     # Persistent state: one (HEAD_DIM, HEAD_DIM) matrix per (slot, head).
     # (bs, qo_heads, d, d)
     s_ptrs = (
@@ -865,9 +795,7 @@ def seg_la_sum_kernel(T, O, DIM: tl.constexpr, NUM_BLOCK: tl.constexpr):
     for i in range(NUM_BLOCK):
         # Stride across blocks is ``length * DIM`` since the layout is
         # (k_dim_block, length, qo_heads * head_dim).
-        x += tl.load(T + i * length * DIM + pid * DIM + tl.arange(0, DIM)).to(
-            tl.float32
-        )
+        x += tl.load(T + i * length * DIM + pid * DIM + tl.arange(0, DIM)).to(tl.float32)
     tl.store(O + pid * DIM + tl.arange(0, DIM), x)
 
 
@@ -929,9 +857,7 @@ def seg_la_fwd(q, k, v, s, decay_scales, meta, caches=None, softmax_scale=None):
         k_dim_block = HEAD_DIM // K_SPLIT_DIM
         v_dim_block = HEAD_DIM // V_SPLIT_DIM
         # Per-K-split temporary outputs to be summed in seg_la_sum_kernel.
-        tmp = torch.empty(
-            (k_dim_block, length, qo_heads, HEAD_DIM), device=q.device, dtype=q.dtype
-        )
+        tmp = torch.empty((k_dim_block, length, qo_heads, HEAD_DIM), device=q.device, dtype=q.dtype)
         # Grid covers (request, head, K-split * V-split). The kernel
         # decomposes pid 2 into (kid, vid) internally.
         grid = (bs, kv_heads, k_dim_block * v_dim_block)
@@ -942,7 +868,7 @@ def seg_la_fwd(q, k, v, s, decay_scales, meta, caches=None, softmax_scale=None):
             # mtp
             EVEN = False
             BLOCK = 32
-            step = length//bs
+            step = length // bs
 
             seg_la_mtp_kernel[grid](
                 q,
@@ -1044,9 +970,7 @@ def seg_la_fwd(q, k, v, s, decay_scales, meta, caches=None, softmax_scale=None):
             if length < 2048:
                 o = tmp.sum(0)
             else:
-                o = torch.empty(
-                    (length, qo_heads, HEAD_DIM), device=q.device, dtype=q.dtype
-                )
+                o = torch.empty((length, qo_heads, HEAD_DIM), device=q.device, dtype=q.dtype)
                 seg_la_sum_kernel[(length,)](
                     tmp,
                     o,
@@ -1077,9 +1001,7 @@ def seg_la_fwd(q, k, v, s, decay_scales, meta, caches=None, softmax_scale=None):
             num_stages = 3  # 3
         k_dim_block = HEAD_DIM // K_SPLIT_DIM
         v_dim_block = HEAD_DIM // V_SPLIT_DIM
-        tmp = torch.empty(
-            (k_dim_block, length, qo_heads, HEAD_DIM), device=q.device, dtype=q.dtype
-        )
+        tmp = torch.empty((k_dim_block, length, qo_heads, HEAD_DIM), device=q.device, dtype=q.dtype)
         grid = (bs, kv_heads, k_dim_block * v_dim_block)
 
         seg_la_d_kernel[grid](

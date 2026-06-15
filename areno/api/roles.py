@@ -30,4 +30,3 @@ class ModelRole:
 
 class MissingRoleCapability(RuntimeError):
     """Raised when a backend cannot execute a required role operation."""
-

@@ -11,8 +11,8 @@ from areno.engine.checkpoints.common import (
     ParallelTensorSpec,
     ReplicatedTensorSpec,
     TopLevelSpec,
-    copy_source_passthrough_weights,
     copy_merged_column,
+    copy_source_passthrough_weights,
     gather_tensor_parallel_column_tensors,
     gather_tensor_parallel_split_column_tensor,
     gather_tensor_parallel_tensor,
@@ -32,7 +32,6 @@ from areno.models.minicpmv46.model import (
     MiniCPMGatedDeltaNet,
     MiniCPMV46ForCausalLM,
 )
-
 
 TOP_LEVEL_SPEC = TopLevelSpec(
     embedding_key="model.language_model.embed_tokens.weight",
@@ -96,7 +95,9 @@ def load_minicpmv46_weights(model: MiniCPMV46ForCausalLM, model_path: str | Path
 
 
 @torch.no_grad()
-def save_minicpmv46_weights(model: MiniCPMV46ForCausalLM, output_path: str | Path, source_path: str | Path | None) -> str | None:
+def save_minicpmv46_weights(
+    model: MiniCPMV46ForCausalLM, output_path: str | Path, source_path: str | Path | None
+) -> str | None:
     """Save MiniCPM-V-4.6 text weights back to HF safetensors layout."""
 
     tensors = CheckpointTensorStore()
@@ -110,7 +111,9 @@ def save_minicpmv46_weights(model: MiniCPMV46ForCausalLM, output_path: str | Pat
     return saved_path
 
 
-def _load_embedding_norm_head(model: MiniCPMV46ForCausalLM, index: SafetensorsIndex, rank: int, world_size: int) -> None:
+def _load_embedding_norm_head(
+    model: MiniCPMV46ForCausalLM, index: SafetensorsIndex, rank: int, world_size: int
+) -> None:
     load_embedding_norm_head(model, index, TOP_LEVEL_SPEC, rank, world_size)
     model.norm.weight.add_(1.0)
 
@@ -138,7 +141,9 @@ def _load_layer(index: SafetensorsIndex, layer: MiniCPMDecoderLayer, prefix: str
         rank,
         world_size,
     )
-    _copy_row(_attr_path(layer, MLP_ROW_SPEC.attr), index.get_tensor(MLP_ROW_SPEC.key.format(prefix=prefix)), rank, world_size)
+    _copy_row(
+        _attr_path(layer, MLP_ROW_SPEC.attr), index.get_tensor(MLP_ROW_SPEC.key.format(prefix=prefix)), rank, world_size
+    )
 
     if isinstance(layer.attention, MiniCPMFullAttention):
         _load_full_attention(index, layer.attention, prefix, rank, world_size)
@@ -152,11 +157,15 @@ def _load_layer(index: SafetensorsIndex, layer: MiniCPMDecoderLayer, prefix: str
 def _save_layer(tensors: dict[str, torch.Tensor | None], layer: MiniCPMDecoderLayer, prefix: str) -> None:
     for spec in LAYER_NORM_SPECS:
         tensors[spec.key.format(prefix=prefix)] = rank0_tensor(_attr_path(layer, spec.attr) - 1.0)
-    gate_weight, up_weight = gather_tensor_parallel_column_tensors(list(_attr_path(layer, GATE_UP_WEIGHT_SPEC.dst_attr).split(layer.mlp.gate_up_proj.local_out_features, dim=0)))
+    gate_weight, up_weight = gather_tensor_parallel_column_tensors(
+        list(_attr_path(layer, GATE_UP_WEIGHT_SPEC.dst_attr).split(layer.mlp.gate_up_proj.local_out_features, dim=0))
+    )
     gate_key, up_key = [key.format(prefix=prefix) for key in GATE_UP_WEIGHT_SPEC.keys]
     tensors[gate_key] = gate_weight
     tensors[up_key] = up_weight
-    tensors[MLP_ROW_SPEC.key.format(prefix=prefix)] = gather_tensor_parallel_tensor(_attr_path(layer, MLP_ROW_SPEC.attr), dim=1)
+    tensors[MLP_ROW_SPEC.key.format(prefix=prefix)] = gather_tensor_parallel_tensor(
+        _attr_path(layer, MLP_ROW_SPEC.attr), dim=1
+    )
 
     if isinstance(layer.attention, MiniCPMFullAttention):
         _save_full_attention(tensors, layer.attention, prefix)
@@ -173,7 +182,9 @@ def _attention_keys(attn: nn.Module, prefix: str) -> list[str]:
     return [key.format(prefix=prefix) for key in GDN_KEYS]
 
 
-def _load_full_attention(index: SafetensorsIndex, attn: MiniCPMFullAttention, prefix: str, rank: int, world_size: int) -> None:
+def _load_full_attention(
+    index: SafetensorsIndex, attn: MiniCPMFullAttention, prefix: str, rank: int, world_size: int
+) -> None:
     q_proj = index.get_tensor(f"{prefix}.self_attn.q_proj.weight")
     q_weight, gate_weight = _split_q_gate_by_head(q_proj, attn.num_heads, attn.head_dim)
     copy_merged_column(
@@ -188,17 +199,50 @@ def _load_full_attention(index: SafetensorsIndex, attn: MiniCPMFullAttention, pr
         world_size,
     )
     _copy_row(attn.o_proj.weight, index.get_tensor(f"{prefix}.self_attn.o_proj.weight"), rank, world_size)
-    attn.q_norm.weight.copy_((index.get_tensor(f"{prefix}.self_attn.q_norm.weight") + 1.0).to(dtype=attn.q_norm.weight.dtype))
-    attn.k_norm.weight.copy_((index.get_tensor(f"{prefix}.self_attn.k_norm.weight") + 1.0).to(dtype=attn.k_norm.weight.dtype))
+    attn.q_norm.weight.copy_(
+        (index.get_tensor(f"{prefix}.self_attn.q_norm.weight") + 1.0).to(dtype=attn.q_norm.weight.dtype)
+    )
+    attn.k_norm.weight.copy_(
+        (index.get_tensor(f"{prefix}.self_attn.k_norm.weight") + 1.0).to(dtype=attn.k_norm.weight.dtype)
+    )
 
 
-def _load_gated_delta_net(index: SafetensorsIndex, attn: MiniCPMGatedDeltaNet, prefix: str, rank: int, world_size: int) -> None:
+def _load_gated_delta_net(
+    index: SafetensorsIndex, attn: MiniCPMGatedDeltaNet, prefix: str, rank: int, world_size: int
+) -> None:
     qkv = index.get_tensor(f"{prefix}.linear_attn.in_proj_qkv.weight")
-    q, k, v = qkv.split((_LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM, _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM, _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM), dim=0)
-    copy_merged_column(attn.in_proj_qkvz.weight, [q, k, v, index.get_tensor(f"{prefix}.linear_attn.in_proj_z.weight")], rank, world_size)
-    copy_merged_column(attn.in_proj_ba.weight, [index.get_tensor(f"{prefix}.linear_attn.in_proj_b.weight"), index.get_tensor(f"{prefix}.linear_attn.in_proj_a.weight")], rank, world_size)
+    q, k, v = qkv.split(
+        (
+            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
+            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
+            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
+        ),
+        dim=0,
+    )
+    copy_merged_column(
+        attn.in_proj_qkvz.weight,
+        [q, k, v, index.get_tensor(f"{prefix}.linear_attn.in_proj_z.weight")],
+        rank,
+        world_size,
+    )
+    copy_merged_column(
+        attn.in_proj_ba.weight,
+        [
+            index.get_tensor(f"{prefix}.linear_attn.in_proj_b.weight"),
+            index.get_tensor(f"{prefix}.linear_attn.in_proj_a.weight"),
+        ],
+        rank,
+        world_size,
+    )
     conv_qkv = index.get_tensor(f"{prefix}.linear_attn.conv1d.weight")
-    conv_parts = conv_qkv.split((_LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM, _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM, _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM), dim=0)
+    conv_parts = conv_qkv.split(
+        (
+            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
+            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
+            _LINEAR_NUM_HEADS * _LINEAR_HEAD_DIM,
+        ),
+        dim=0,
+    )
     copy_merged_column(attn.conv1d_weight, list(conv_parts), rank, world_size)
     start, end = _shard_range(_LINEAR_NUM_HEADS, rank, world_size)
     attn.dt_bias.copy_(index.get_tensor(f"{prefix}.linear_attn.dt_bias")[start:end].to(dtype=attn.dt_bias.dtype))
@@ -214,7 +258,9 @@ def _save_full_attention(tensors: dict[str, torch.Tensor | None], attn: MiniCPMF
     k = attn.qkv_proj.weight[q_size + gate_size : q_size + gate_size + k_size]
     v = attn.qkv_proj.weight[q_size + gate_size + k_size : q_size + gate_size + k_size + v_size]
     q_weight, gate_weight = gather_tensor_parallel_column_tensors([q, gate])
-    tensors[f"{prefix}.self_attn.q_proj.weight"] = _merge_q_gate_by_head(q_weight, gate_weight, attn.num_heads, attn.head_dim)
+    tensors[f"{prefix}.self_attn.q_proj.weight"] = _merge_q_gate_by_head(
+        q_weight, gate_weight, attn.num_heads, attn.head_dim
+    )
     k_weight, v_weight = gather_tensor_parallel_column_tensors([k, v])
     tensors[f"{prefix}.self_attn.k_proj.weight"] = k_weight
     tensors[f"{prefix}.self_attn.v_proj.weight"] = v_weight
@@ -227,7 +273,9 @@ def _save_gated_delta_net(tensors: dict[str, torch.Tensor | None], attn: MiniCPM
     q_size, k_size, v_size, z_size = attn.in_proj_qkvz.local_out_features
     qkv = attn.in_proj_qkvz.weight[: q_size + k_size + v_size]
     z = attn.in_proj_qkvz.weight[q_size + k_size + v_size : q_size + k_size + v_size + z_size]
-    tensors[f"{prefix}.linear_attn.in_proj_qkv.weight"] = gather_tensor_parallel_split_column_tensor(qkv, [q_size, k_size, v_size])
+    tensors[f"{prefix}.linear_attn.in_proj_qkv.weight"] = gather_tensor_parallel_split_column_tensor(
+        qkv, [q_size, k_size, v_size]
+    )
     (z_weight,) = gather_tensor_parallel_column_tensors([z])
     tensors[f"{prefix}.linear_attn.in_proj_z.weight"] = z_weight
 
@@ -242,7 +290,9 @@ def _save_gated_delta_net(tensors: dict[str, torch.Tensor | None], attn: MiniCPM
     conv_q = attn.local_key_dim
     conv_k = attn.local_key_dim
     conv_v = attn.local_value_dim
-    tensors[f"{prefix}.linear_attn.conv1d.weight"] = gather_tensor_parallel_split_column_tensor(local_conv_qkv, [conv_q, conv_k, conv_v])
+    tensors[f"{prefix}.linear_attn.conv1d.weight"] = gather_tensor_parallel_split_column_tensor(
+        local_conv_qkv, [conv_q, conv_k, conv_v]
+    )
     tensors[f"{prefix}.linear_attn.dt_bias"] = gather_tensor_parallel_tensor(attn.dt_bias, dim=0)
     tensors[f"{prefix}.linear_attn.A_log"] = gather_tensor_parallel_tensor(attn.A_log, dim=0)
     tensors[f"{prefix}.linear_attn.norm.weight"] = rank0_tensor(attn.norm_weight)
@@ -257,7 +307,9 @@ def _attr_path(obj: object, path: str):
 
 def _split_q_gate_by_head(q_proj: torch.Tensor, num_heads: int, head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
     q_gate = q_proj.reshape(num_heads, 2, head_dim, q_proj.shape[1])
-    return q_gate[:, 0].reshape(num_heads * head_dim, q_proj.shape[1]), q_gate[:, 1].reshape(num_heads * head_dim, q_proj.shape[1])
+    return q_gate[:, 0].reshape(num_heads * head_dim, q_proj.shape[1]), q_gate[:, 1].reshape(
+        num_heads * head_dim, q_proj.shape[1]
+    )
 
 
 class _MergedQGateByHeadTask(_CheckpointTensorTask):

@@ -31,8 +31,7 @@ import torch
 import triton
 import triton.language as tl
 
-from areno.accel import areno_moe_align
-from areno.accel import areno_gelu_tanh_and_mul, areno_silu_and_mul
+from areno.accel import areno_gelu_tanh_and_mul, areno_moe_align, areno_silu_and_mul
 
 
 @dataclass(slots=True)
@@ -55,6 +54,7 @@ class FusedMoeConfig:
         group_size_m: L2-friendly M-supergroup factor; controls the
             ``pid_m / pid_n`` swizzle inside the matmul kernel.
     """
+
     num_experts: int
     hidden_size: int
     intermediate_size: int
@@ -71,7 +71,9 @@ def is_available() -> bool:
     return True
 
 
-def _align_block_size(topk_ids: torch.Tensor, block_size: int, num_experts: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _align_block_size(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sort flat (token, expert) pairs by expert and pad to ``block_size``.
 
     Wraps the external ``areno_moe_align`` CUDA op. Returns:
@@ -208,7 +210,9 @@ def _fused_moe_matmul_kernel(
     # expert. -1 means the block is entirely padding; fast-path to a zero write.
     off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_expert == -1:
-        _write_zeros_to_output(c_ptr, stride_cm, stride_cn, pid_n, N, offs_token, token_mask, BLOCK_SIZE_M, BLOCK_SIZE_N, compute_type)
+        _write_zeros_to_output(
+            c_ptr, stride_cm, stride_cn, pid_n, N, offs_token, token_mask, BLOCK_SIZE_M, BLOCK_SIZE_N, compute_type
+        )
         return
 
     # offs_bn wraps with % N so out-of-range columns reuse valid pointers.
@@ -292,7 +296,20 @@ def _moe_sum_reduce_kernel(
     tl.store(store_ptrs, accumulator.to(input_ptr.dtype.element_ty), mask=mask_token[:, None] & mask_dim[None, :])
 
 
-def _invoke_matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, sorted_token_ids: torch.Tensor, expert_ids: torch.Tensor, num_tokens_post_padded: torch.Tensor, *, mul_routed_weight: bool, top_k: int, config: FusedMoeConfig) -> None:
+def _invoke_matmul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    *,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: FusedMoeConfig,
+) -> None:
     """Launch ``_fused_moe_matmul_kernel`` over the sorted token list.
 
     Grid size is computed from the padded M length (so every assignable block
@@ -300,9 +317,13 @@ def _invoke_matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, topk_weigh
     so accumulators downcast correctly on store. ``even_k`` selects the fast
     unmasked K-load path when N divides BLOCK_SIZE_K evenly.
     """
-    grid = lambda meta: (
-        triton.cdiv(sorted_token_ids.shape[0], meta["BLOCK_SIZE_M"]) * triton.cdiv(b.shape[1], meta["BLOCK_SIZE_N"]),
-    )
+
+    def grid(meta):
+        return (
+            triton.cdiv(sorted_token_ids.shape[0], meta["BLOCK_SIZE_M"])
+            * triton.cdiv(b.shape[1], meta["BLOCK_SIZE_N"]),
+        )
+
     compute_type = tl.bfloat16 if a.dtype == torch.bfloat16 else tl.float16
     _fused_moe_matmul_kernel[grid](
         a,
@@ -398,18 +419,34 @@ def fused_experts(
     topk_ids = topk_ids.int().contiguous()
     num_tokens = hidden_states.shape[0]
     top_k = topk_ids.shape[1]
-    sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size(topk_ids, config.block_size_m, config.num_experts)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size(
+        topk_ids, config.block_size_m, config.num_experts
+    )
 
     # Single backing buffer reused across both matmul outputs; w1 and w2 may
     # have different output widths so we size to the max and slice as views.
     max_intermediate = max(w1.shape[1], w2.shape[1])
     cache = torch.empty(num_tokens * top_k * max_intermediate, device=hidden_states.device, dtype=hidden_states.dtype)
     intermediate1 = cache[: num_tokens * top_k * w1.shape[1]].view(num_tokens, top_k, w1.shape[1])
-    intermediate2 = torch.empty((num_tokens * top_k, w1.shape[1] // 2), device=hidden_states.device, dtype=hidden_states.dtype)
+    intermediate2 = torch.empty(
+        (num_tokens * top_k, w1.shape[1] // 2), device=hidden_states.device, dtype=hidden_states.dtype
+    )
     intermediate3 = cache[: num_tokens * top_k * w2.shape[1]].view(num_tokens, top_k, w2.shape[1])
 
     # Gate-up projection (no routed weight applied here — that happens in matmul2).
-    _invoke_matmul(hidden_states, w1, intermediate1, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, mul_routed_weight=False, top_k=top_k, config=config)
+    _invoke_matmul(
+        hidden_states,
+        w1,
+        intermediate1,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        mul_routed_weight=False,
+        top_k=top_k,
+        config=config,
+    )
     # Gated activation: out[:, i] = act(in[:, i]) * in[:, intermediate + i].
     if activation == "silu":
         areno_silu_and_mul(intermediate1.view(-1, w1.shape[1]), intermediate2)
@@ -419,7 +456,19 @@ def fused_experts(
         raise ValueError(f"unsupported fused MoE activation {activation!r}")
     # Down projection with routed weight folded in. top_k=1 because each
     # source token has already been expanded across the M axis.
-    _invoke_matmul(intermediate2, w2, intermediate3, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, mul_routed_weight=True, top_k=1, config=config)
+    _invoke_matmul(
+        intermediate2,
+        w2,
+        intermediate3,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        mul_routed_weight=True,
+        top_k=1,
+        config=config,
+    )
 
     out = torch.empty_like(hidden_states)
     _sum_reduce(intermediate3, out, config.routed_scaling_factor)

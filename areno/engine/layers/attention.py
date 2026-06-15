@@ -11,14 +11,14 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from areno.engine.runtime.metadata import InferMeta, TrainMeta
+from areno.engine.config import ModelConfig
 from areno.engine.layers.attention_backend.infer import FlashAttnInferBackend, build_infer_attention_backend
 from areno.engine.layers.attention_backend.train import build_train_attention_backend
-from areno.engine.config import ModelConfig
-from areno.engine.parallel.context import get_tp_context
 from areno.engine.layers.linear import QKVParallelLinear, RowParallelLinear
 from areno.engine.layers.norm import RMSNorm
 from areno.engine.layers.rotary import RotaryEmbedding
+from areno.engine.parallel.context import get_tp_context
+from areno.engine.runtime.metadata import InferMeta, TrainMeta
 
 
 class CausalSelfAttention(nn.Module):
@@ -100,7 +100,9 @@ class CausalSelfAttention(nn.Module):
             return self.forward_infer(q, k, v, infer_meta)
         return self.forward_train(q, k, v, train_meta)
 
-    def forward_train(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, train_meta: TrainMeta | None) -> torch.Tensor:
+    def forward_train(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, train_meta: TrainMeta | None
+    ) -> torch.Tensor:
         """Run training FlashAttention then collapse heads back to hidden dim."""
 
         out = self.train_backend(q, k, v, train_meta)

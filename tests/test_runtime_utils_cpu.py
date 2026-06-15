@@ -31,7 +31,9 @@ def _rollout(prompt_ids, response_ids, logprobs, finish_reason=None, metrics=Non
         input_ids=torch.zeros(rows, max_len, dtype=torch.long),
         attention_mask=torch.zeros(rows, max_len, dtype=torch.long),
         response_mask=torch.zeros(rows, max_len, dtype=torch.long),
-        logprobs=torch.tensor(logprobs, dtype=torch.float32).reshape(rows, max_resp) if rows and max_resp else torch.empty(rows, 0),
+        logprobs=torch.tensor(logprobs, dtype=torch.float32).reshape(rows, max_resp)
+        if rows and max_resp
+        else torch.empty(rows, 0),
         finish_reason=finish_reason or ["length"] * rows,
         metrics=metrics,
     )
@@ -70,7 +72,9 @@ class RuntimeCommonTest(unittest.TestCase):
 
     def test_dp_rank0_results_drops_tensor_parallel_duplicates(self):
         """Coordinator should keep only TP rank 0 from each DP group."""
-        self.assertEqual(dp_rank0_results(["dp0tp0", "dp0tp1", "dp1tp0", "dp1tp1"], tp_size=2, dp_size=2), ["dp0tp0", "dp1tp0"])
+        self.assertEqual(
+            dp_rank0_results(["dp0tp0", "dp0tp1", "dp1tp0", "dp1tp1"], tp_size=2, dp_size=2), ["dp0tp0", "dp1tp0"]
+        )
 
     def test_score_result_merge_restores_dp_strided_order(self):
         """Score ops should merge local DP shards without worker-side gather."""

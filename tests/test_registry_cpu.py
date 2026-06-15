@@ -97,7 +97,14 @@ class RegistryTest(unittest.TestCase):
         """Build/load/save must route through the adapter selected by model_type."""
         adapter = FakeAdapter()
         registry.register_adapter(adapter)
-        config = ModelConfig(model_type="fake", hidden_size=8, intermediate_size=8, num_attention_heads=1, num_key_value_heads=1, vocab_size=8)
+        config = ModelConfig(
+            model_type="fake",
+            hidden_size=8,
+            intermediate_size=8,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            vocab_size=8,
+        )
         model = registry.build_model(config)
 
         registry.load_model_weights(model, config, "/ckpt")
@@ -113,7 +120,14 @@ class RegistryTest(unittest.TestCase):
         """Saving should strip torch.compile-style wrappers before serialization."""
         adapter = FakeAdapter()
         registry.register_adapter(adapter)
-        config = ModelConfig(model_type="fake", hidden_size=8, intermediate_size=8, num_attention_heads=1, num_key_value_heads=1, vocab_size=8)
+        config = ModelConfig(
+            model_type="fake",
+            hidden_size=8,
+            intermediate_size=8,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            vocab_size=8,
+        )
         raw = nn.Linear(2, 2)
         wrapped_once = type("Wrapped", (), {"_orig_mod": raw})()
         wrapped_twice = type("WrappedAgain", (), {"_orig_mod": wrapped_once})()

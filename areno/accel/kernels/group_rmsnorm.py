@@ -94,7 +94,9 @@ def _rms_norm_gate_kernel(
     tl.store(Y + cols * stride_y2, y, mask=mask)
 
 
-def rms_norm_gate_fwd(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+def rms_norm_gate_fwd(
+    x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for fused group RMSNorm + Swish gating.
 
     Args:
@@ -152,4 +154,3 @@ def rms_norm_gate_fwd(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor,
         block_n,
     )
     return y, rstd
-

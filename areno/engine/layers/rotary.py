@@ -43,7 +43,9 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Gather positional cos/sin and broadcast over heads (unsqueeze(2)).
         cos = self.cos_cached[position_ids].unsqueeze(2).to(dtype=q.dtype)
         sin = self.sin_cached[position_ids].unsqueeze(2).to(dtype=q.dtype)
@@ -58,7 +60,9 @@ class PartialRotaryEmbedding(nn.Module):
     adjacent channels) rotation via ``is_neox_style``.
     """
 
-    def __init__(self, head_dim: int, max_position: int, theta: float, partial_rotary_factor: float, *, is_neox_style: bool):
+    def __init__(
+        self, head_dim: int, max_position: int, theta: float, partial_rotary_factor: float, *, is_neox_style: bool
+    ):
         super().__init__()
         self.is_neox_style = is_neox_style
         # Only this many leading channels get rotated.
@@ -70,7 +74,9 @@ class PartialRotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         cos = self.cos_cached[position_ids].unsqueeze(2).to(dtype=q.dtype)
         sin = self.sin_cached[position_ids].unsqueeze(2).to(dtype=q.dtype)
         # Split each head into rotated and pass-through segments.
@@ -107,7 +113,9 @@ class Gemma4RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         cos = self.cos_cached[position_ids].unsqueeze(2).to(dtype=q.dtype)
         sin = self.sin_cached[position_ids].unsqueeze(2).to(dtype=q.dtype)
         return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)

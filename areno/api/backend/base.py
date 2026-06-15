@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 
 from areno.api.context import Context
-from areno.api.models import SamplingParams, RolloutResult, TrainSequence
+from areno.api.models import RolloutResult, SamplingParams, TrainSequence
 from areno.api.roles import ModelRole
 
 # Map BackendType -> implementation class, populated by `register_backend`.
@@ -23,12 +23,14 @@ BACKEND_MODULES = {
     "Areno": "areno.api.backend.areno",
 }
 
+
 def register_backend(backend_type):
     """Register a backend implementation class for `Trainer` construction."""
 
     def decorator(cls):
         BACKEND_CLS[backend_type] = cls
         return cls
+
     return decorator
 
 

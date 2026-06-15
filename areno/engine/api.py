@@ -20,8 +20,9 @@ High-level responsibilities:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from itertools import count
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -39,8 +40,6 @@ from areno.engine.protocol import (
     TrainPayload,
     TrainValuesPayload,
 )
-from areno.engine.worker import ArenoWorker
-from areno.models.registry import config_from_hf
 from areno.engine.runtime.common import (
     dp_rank0_results,
     merge_metric_dicts,
@@ -50,6 +49,8 @@ from areno.engine.runtime.common import (
 )
 from areno.engine.runtime.decode_graph import ceil_div
 from areno.engine.runtime.rollout import _build_rollout_from_rows, _merge_dp_rollouts_in_input_order, _merge_rollouts
+from areno.engine.worker import ArenoWorker
+from areno.models.registry import config_from_hf
 
 
 def _merge_async_dp_rollouts(outputs: list[RolloutOutput | None], *, total_count: int) -> RolloutOutput:
@@ -184,7 +185,7 @@ class ArenoEngine:
         optimizer_config: OptimizerConfig | None = None,
         runtime_config: RuntimeConfig | None = None,
         loss_fn: Callable[[Any, torch.Tensor], torch.Tensor | tuple[torch.Tensor, dict[str, Any]]] | None = None,
-    ) -> "ArenoEngine":
+    ) -> ArenoEngine:
         """Build an engine by reading model config from a checkpoint path.
 
         Resolves a local path or HuggingFace repo id to a concrete checkpoint
@@ -246,7 +247,9 @@ class ArenoEngine:
         outputs = []
         # Cap prompt length for KV sizing; either honour caller-provided bound
         # or fall back to the longest prompt actually seen.
-        rollout_max_prompt_len = int(max_prompt_len) if max_prompt_len is not None else max(len(prompt) for prompt in prompts)
+        rollout_max_prompt_len = (
+            int(max_prompt_len) if max_prompt_len is not None else max(len(prompt) for prompt in prompts)
+        )
         rollout_max_cache_len = rollout_max_prompt_len + max_new_tokens
         dp_size = int(self.config.dp_size)
         local_max_running_prompts = max(ceil_div(int(max_running_prompts), dp_size), 1)
@@ -266,7 +269,9 @@ class ArenoEngine:
             # Round-robin chunk rows across DP ranks; per-rank token rows.
             prompts_by_dp = split_list_by_dp(chunk, int(self.config.dp_size))
             # Parallel split of the global prompt indices for downstream mapping.
-            prompt_indices_by_dp = split_list_by_dp(list(range(chunk_start, chunk_start + len(chunk))), int(self.config.dp_size))
+            prompt_indices_by_dp = split_list_by_dp(
+                list(range(chunk_start, chunk_start + len(chunk))), int(self.config.dp_size)
+            )
             # Largest per-rank queue depth for the current chunk; floor of 1
             # avoids zero-sized KV pools for trailing chunks.
             current_local_running = max(max((len(rows) for rows in prompts_by_dp), default=0), 1)
@@ -359,7 +364,9 @@ class ArenoEngine:
             raise ValueError("max_running_prompts must be >= 1")
         sampling_params = sampling_params or SamplingParams()
         outputs = []
-        rollout_max_prompt_len = int(max_prompt_len) if max_prompt_len is not None else max(len(prompt) for prompt in prompts)
+        rollout_max_prompt_len = (
+            int(max_prompt_len) if max_prompt_len is not None else max(len(prompt) for prompt in prompts)
+        )
         rollout_max_cache_len = rollout_max_prompt_len + max_new_tokens
         dp_size = int(self.config.dp_size)
         if not hasattr(self, "_async_dp_cursor"):
@@ -376,7 +383,9 @@ class ArenoEngine:
         for chunk in chunks:
             chunk_start = sum(len(output.prompt_ids) for output in outputs)
             prompts_by_dp = _split_list_by_dp_with_offset(chunk, dp_size, dp_start)
-            prompt_indices_by_dp = _split_list_by_dp_with_offset(list(range(chunk_start, chunk_start + len(chunk))), dp_size, dp_start)
+            prompt_indices_by_dp = _split_list_by_dp_with_offset(
+                list(range(chunk_start, chunk_start + len(chunk))), dp_size, dp_start
+            )
             current_local_running = max(max((len(rows) for rows in prompts_by_dp), default=0), 1)
             capacity_local_running = local_max_running_prompts if cancel_flags is None else current_local_running
             max_cache_len = max(max(len(prompt) + max_new_tokens for prompt in chunk), rollout_max_cache_len)
@@ -395,7 +404,9 @@ class ArenoEngine:
                 block_size=self.config.runtime.kv_block_size,
                 decode_progress_interval_s=decode_progress_interval_s,
                 cancel_flags=cancel_flags,
-                cancel_indices_by_dp=_split_list_by_dp_with_offset(list(range(chunk_start, chunk_start + len(chunk))), dp_size, dp_start)
+                cancel_indices_by_dp=_split_list_by_dp_with_offset(
+                    list(range(chunk_start, chunk_start + len(chunk))), dp_size, dp_start
+                )
                 if cancel_flags is not None
                 else None,
             )
@@ -414,7 +425,9 @@ class ArenoEngine:
             )
         return outputs[0] if len(outputs) == 1 else _merge_rollouts(outputs)
 
-    def step(self, data_packs: list[dict[str, Any]], *, gradient_accumulation_steps: int | None = None) -> list[TrainStats]:
+    def step(
+        self, data_packs: list[dict[str, Any]], *, gradient_accumulation_steps: int | None = None
+    ) -> list[TrainStats]:
         """Run one or more train data packs through the DP/TP worker cluster.
 
         Dispatches ``Op.TRAIN`` via the blocking ``cluster.call`` path. Each
@@ -486,7 +499,11 @@ class ArenoEngine:
             return []
         results = self.cluster.call(
             Op.SCORE_LOGPROBS,
-            ScorePayload(role=role, token_rows_by_dp=split_list_by_dp(token_rows, int(self.config.dp_size)), pad_token_id=int(pad_token_id)),
+            ScorePayload(
+                role=role,
+                token_rows_by_dp=split_list_by_dp(token_rows, int(self.config.dp_size)),
+                pad_token_id=int(pad_token_id),
+            ),
         )
         return _merge_dp_rank0_strided_results(results, self.config.tp_size, int(self.config.dp_size))
 
@@ -501,7 +518,11 @@ class ArenoEngine:
             return []
         results = self.cluster.call(
             Op.SCORE_VALUES,
-            ScorePayload(role=role, token_rows_by_dp=split_list_by_dp(token_rows, int(self.config.dp_size)), pad_token_id=int(pad_token_id)),
+            ScorePayload(
+                role=role,
+                token_rows_by_dp=split_list_by_dp(token_rows, int(self.config.dp_size)),
+                pad_token_id=int(pad_token_id),
+            ),
         )
         return _merge_dp_rank0_strided_results(results, self.config.tp_size, int(self.config.dp_size))
 
@@ -516,7 +537,11 @@ class ArenoEngine:
             return []
         results = self.cluster.call(
             Op.SCORE_REWARDS,
-            ScorePayload(role=role, token_rows_by_dp=split_list_by_dp(token_rows, int(self.config.dp_size)), pad_token_id=int(pad_token_id)),
+            ScorePayload(
+                role=role,
+                token_rows_by_dp=split_list_by_dp(token_rows, int(self.config.dp_size)),
+                pad_token_id=int(pad_token_id),
+            ),
         )
         return _merge_dp_rank0_strided_results(results, self.config.tp_size, int(self.config.dp_size))
 
@@ -558,7 +583,9 @@ class ArenoEngine:
                 value_loss_coef=float(value_loss_coef),
             ),
         )
-        rank0_results = [result for result in dp_rank0_results(results, self.config.tp_size, int(self.config.dp_size)) if result]
+        rank0_results = [
+            result for result in dp_rank0_results(results, self.config.tp_size, int(self.config.dp_size)) if result
+        ]
         return merge_metric_dicts(rank0_results) or {}
 
     def save_checkpoint(self, path: str) -> str:
@@ -587,7 +614,7 @@ class ArenoEngine:
 
         self.cluster.close()
 
-    def __enter__(self) -> "ArenoEngine":
+    def __enter__(self) -> ArenoEngine:
         """Return self for `with ArenoEngine...` usage."""
 
         return self

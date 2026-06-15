@@ -9,8 +9,9 @@ groups consumed by the worker cluster.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 import torch
 
@@ -125,7 +126,9 @@ class ModelConfig:
         if self.num_attention_heads % tp_size != 0:
             raise ValueError("num_attention_heads must be divisible by tp_size")
         if self.num_key_value_heads % tp_size != 0:
-            allow_replicated_kv = self.model_type in {"gemma4", "qwen3_moe", "qwen3_5_moe"} and tp_size % self.num_key_value_heads == 0
+            allow_replicated_kv = (
+                self.model_type in {"gemma4", "qwen3_moe", "qwen3_5_moe"} and tp_size % self.num_key_value_heads == 0
+            )
             if not allow_replicated_kv:
                 raise ValueError("num_key_value_heads must be divisible by tp_size")
         if self.swa_num_key_value_heads is not None:
@@ -193,7 +196,6 @@ class EngineConfig:
             raise ValueError("runtime.kv_block_size must be >= 1")
         if self.runtime.kv_block_size % 256 != 0:
             raise ValueError("runtime.kv_block_size must be a multiple of 256 for FlashAttention paged KV")
-
 
 
 def _parse_dtype(value: str | None) -> torch.dtype:

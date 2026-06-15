@@ -39,7 +39,7 @@ class MetricsRecorder:
         self._closed = True
         self._writer.close()
 
-    def __enter__(self) -> "MetricsRecorder":
+    def __enter__(self) -> MetricsRecorder:
         """Return the recorder for context-manager usage."""
 
         return self

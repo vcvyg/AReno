@@ -36,21 +36,45 @@ and a sparse mixture-of-experts MLP:
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 import torch.distributed as dist
-from areno.accel import areno_grouped_linear, areno_grouped_topk_router, areno_linear, areno_moe_topk_permute, areno_moe_unpermute, areno_sigmoid, areno_silu
 from fla.ops.lightning_attn import chunk_lightning_attn
 from torch import nn
 
-from areno.engine.runtime.metadata import InferMeta, TrainMeta
-from areno.engine.layers.attention_backend.infer import FlashAttnInferBackend, build_infer_attention_backend
-from areno.engine.layers.attention_backend.train import build_train_attention_backend
-from areno.models.bailing.checkpoint import CHECKPOINT_SPEC
+from areno.accel import (
+    areno_grouped_linear,
+    areno_grouped_topk_router,
+    areno_linear,
+    areno_moe_topk_permute,
+    areno_moe_unpermute,
+    areno_sigmoid,
+    areno_silu,
+)
+from areno.accel.ops import (
+    FusedMoeConfig,
+    SegLaMeta,
+    areno_fused_experts,
+    areno_silu_and_mul,
+    log_once,
+    seg_la_fwd,
+)
 from areno.engine.checkpoints.common import load_checkpoint_weights, save_checkpoint_weights
 from areno.engine.config import ModelConfig, _parse_dtype
+from areno.engine.layers.attention_backend.infer import FlashAttnInferBackend, build_infer_attention_backend
+from areno.engine.layers.attention_backend.train import build_train_attention_backend
+from areno.engine.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    _shard_range,
+    mark_tensor_parallel_parameter,
+)
+from areno.engine.layers.norm import GroupRMSNormSigmoidGate, RMSNorm
+from areno.engine.layers.rotary import PartialRotaryEmbedding
+from areno.engine.layers.vocab import VocabParallelEmbedding, VocabParallelLMHead
 from areno.engine.parallel.collectives import (
     all_reduce,
     gather_from_sequence_parallel_region,
@@ -60,19 +84,9 @@ from areno.engine.parallel.collectives import (
     sequence_parallel_region,
 )
 from areno.engine.parallel.context import get_tp_context
-from areno.engine.layers.linear import ColumnParallelLinear, RowParallelLinear, _shard_range, mark_tensor_parallel_parameter
-from areno.engine.layers.vocab import VocabParallelEmbedding, VocabParallelLMHead
-from areno.engine.layers.norm import GroupRMSNormSigmoidGate, RMSNorm
-from areno.engine.layers.rotary import PartialRotaryEmbedding
+from areno.engine.runtime.metadata import InferMeta, TrainMeta
+from areno.models.bailing.checkpoint import CHECKPOINT_SPEC
 from areno.models.base import CausalLMOutput, ModelAdapter
-from areno.accel.ops import (
-    FusedMoeConfig,
-    SegLaMeta,
-    areno_silu_and_mul,
-    areno_fused_experts,
-    log_once,
-    seg_la_fwd,
-)
 
 
 class BailingDenseMLP(nn.Module):
@@ -129,7 +143,9 @@ class BailingGate(nn.Module):
         # end of an optimizer step. ``expert_bias`` is the slowly-updated
         # canonical value, ``local_expert_bias`` is the snapshot used by the
         # kernel each forward pass.
-        self.register_buffer("local_tokens_per_expert", torch.zeros(self.num_experts, dtype=torch.float32), persistent=False)
+        self.register_buffer(
+            "local_tokens_per_expert", torch.zeros(self.num_experts, dtype=torch.float32), persistent=False
+        )
         self.register_buffer("expert_bias", torch.zeros(self.num_experts), persistent=False)
         self.register_buffer("local_expert_bias", torch.zeros(self.num_experts), persistent=False)
 
@@ -226,14 +242,12 @@ class BailingSparseMoeBlock(nn.Module):
         self.register_buffer("_infer_w1_weight", torch.empty(0), persistent=False)
         self.register_buffer("_infer_w2_weight", torch.empty(0), persistent=False)
         self._infer_weights_ready = False
-        self._fused_moe_config = (
-            FusedMoeConfig(
-                num_experts=self.experts.local_num_experts,
-                hidden_size=self.config.hidden_size,
-                intermediate_size=self.config.moe_intermediate_size,
-                top_k=self.num_experts_per_tok,
-                routed_scaling_factor=self.config.routed_scaling_factor,
-            )
+        self._fused_moe_config = FusedMoeConfig(
+            num_experts=self.experts.local_num_experts,
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.moe_intermediate_size,
+            top_k=self.num_experts_per_tok,
+            routed_scaling_factor=self.config.routed_scaling_factor,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -377,7 +391,9 @@ class BailingGroupedExperts(nn.Module):
     def forward(self, flat: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
         return self._forward_fused_permute(flat, topk_idx, topk_weight)
 
-    def _forward_fused_permute(self, flat: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+    def _forward_fused_permute(
+        self, flat: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor
+    ) -> torch.Tensor:
         log_once("areno_moe_permute", "using fused MoE permute/unpermute kernels")
         # Permute: group tokens by destination expert, keeping only routes for
         # locally-owned experts. ``tokens_per_expert`` is a 1D count used to
@@ -396,12 +412,13 @@ class BailingGroupedExperts(nn.Module):
         hidden, _ = _grouped_linear_forward(self.linear_fc1, x.contiguous(), tokens_per_expert)
         # Apply routing weight before fc2 so it stays inside the fp32 reduction.
         hidden = (
-            _areno_silu_and_mul_no_compile(hidden)
-            * sorted_route_weight.unsqueeze(-1).to(dtype=hidden.dtype)
+            _areno_silu_and_mul_no_compile(hidden) * sorted_route_weight.unsqueeze(-1).to(dtype=hidden.dtype)
         ).contiguous()
         expert_out, _ = _grouped_linear_forward(self.linear_fc2, hidden, tokens_per_expert)
         # Unpermute back to original (batch, seq) order, then scale and reduce.
-        out = _areno_moe_unpermute_no_compile(expert_out, sorted_token_idx, merging_probs=None, restore_shape=flat.shape)
+        out = _areno_moe_unpermute_no_compile(
+            expert_out, sorted_token_idx, merging_probs=None, restore_shape=flat.shape
+        )
         return all_reduce(out * self.config.routed_scaling_factor)
 
     def local_routes(self, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -411,7 +428,9 @@ class BailingGroupedExperts(nn.Module):
         return local_idx, topk_weight * local_mask.to(dtype=topk_weight.dtype)
 
     @torch.no_grad()
-    def copy_expert(self, expert_id: int, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor, rank: int, world_size: int) -> None:
+    def copy_expert(
+        self, expert_id: int, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor, rank: int, world_size: int
+    ) -> None:
         """Copy one expert's HF weights into the appropriate local slot."""
         del rank, world_size
         if expert_id < self.local_expert_start or expert_id >= self.local_expert_end:
@@ -499,7 +518,9 @@ class ArenoGroupedLinear(nn.Module):
         return areno_grouped_linear(x.contiguous(), self.weight, tokens_per_expert)
 
 
-def _grouped_linear_forward(module: nn.Module, x: torch.Tensor, tokens_per_expert: torch.Tensor | Sequence[int]) -> tuple[torch.Tensor, torch.Tensor | None]:
+def _grouped_linear_forward(
+    module: nn.Module, x: torch.Tensor, tokens_per_expert: torch.Tensor | Sequence[int]
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     out = module(x, tokens_per_expert)
     if isinstance(out, tuple):
         return out
@@ -640,7 +661,9 @@ class BailingSoftmaxAttention(nn.Module):
             # Standard GQA: one fused QKV projection.
             self.num_qkv_heads = self.num_heads + 2 * self.num_kv_heads
             self.local_qkv_heads = self.local_heads + 2 * self.local_kv_heads
-            self.query_key_value = ColumnParallelLinear(config.hidden_size, self.num_qkv_heads * config.head_dim, bias=config.qkv_bias)
+            self.query_key_value = ColumnParallelLinear(
+                config.hidden_size, self.num_qkv_heads * config.head_dim, bias=config.qkv_bias
+            )
             self.query_layernorm = RMSNorm(config.head_dim, config.rms_norm_eps) if config.qk_norm else None
             self.key_layernorm = RMSNorm(config.head_dim, config.rms_norm_eps) if config.qk_norm else None
         else:
@@ -649,10 +672,16 @@ class BailingSoftmaxAttention(nn.Module):
             # decompression (``kv_b_proj``). The ``kv_a`` output also carries
             # the rope channels in its tail (``qk_rope_head_dim`` cols).
             self.q_proj = ColumnParallelLinear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
-            self.kv_a_proj_with_mqa = nn.Linear(config.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
-            mark_tensor_parallel_parameter(self.kv_a_proj_with_mqa.weight, False, sequence_parallel=True, tp_grad_allreduce=True)
+            self.kv_a_proj_with_mqa = nn.Linear(
+                config.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
+            )
+            mark_tensor_parallel_parameter(
+                self.kv_a_proj_with_mqa.weight, False, sequence_parallel=True, tp_grad_allreduce=True
+            )
             self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
-            self.kv_b_proj = ColumnParallelLinear(config.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
+            self.kv_b_proj = ColumnParallelLinear(
+                config.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False
+            )
             self.query_layernorm = None
             self.key_layernorm = None
         self.dense = RowParallelLinear(self.num_heads * self.v_head_dim, config.hidden_size, bias=config.use_bias)
@@ -670,7 +699,13 @@ class BailingSoftmaxAttention(nn.Module):
         self.k_cache = torch.tensor([])
         self.v_cache = torch.tensor([])
 
-    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, train_meta: TrainMeta | None, infer_meta: InferMeta | None) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        train_meta: TrainMeta | None,
+        infer_meta: InferMeta | None,
+    ) -> torch.Tensor:
         bsz, seqlen, _ = hidden_states.shape
         q, k, v = self._project(hidden_states, position_ids)
         if infer_meta is not None:
@@ -683,23 +718,36 @@ class BailingSoftmaxAttention(nn.Module):
             out = self.train_backend(q, k, v, train_meta)
         return self.dense(out.contiguous().view(bsz, seqlen, self.local_heads * self.v_head_dim))
 
-    def _project(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _project(
+        self, hidden_states: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seqlen, _ = hidden_states.shape
         if self.kv_lora_rank is None:
             # Standard GQA path: split fused QKV, optional per-head norm, rope
             # on the trailing qk_rope_head_dim channels only.
             assert self.query_key_value is not None
-            qkv = self.query_key_value(hidden_states).view(bsz, seqlen, self.local_heads + 2 * self.local_kv_heads, self.head_dim)
+            qkv = self.query_key_value(hidden_states).view(
+                bsz, seqlen, self.local_heads + 2 * self.local_kv_heads, self.head_dim
+            )
             q, k, v = qkv.split([self.local_heads, self.local_kv_heads, self.local_kv_heads], dim=-2)
             if self.query_layernorm is not None:
                 q = self.query_layernorm(q)
                 k = self.key_layernorm(k)
             q_rope, k_rope = self.rope(q[..., -self.qk_rope_head_dim :], k[..., -self.qk_rope_head_dim :], position_ids)
-            return torch.cat((q[..., : self.qk_nope_head_dim], q_rope), dim=-1), torch.cat((k[..., : self.qk_nope_head_dim], k_rope), dim=-1), v
+            return (
+                torch.cat((q[..., : self.qk_nope_head_dim], q_rope), dim=-1),
+                torch.cat((k[..., : self.qk_nope_head_dim], k_rope), dim=-1),
+                v,
+            )
 
         # MLA path: split Q into nope/rope chunks, decompress KV from the
         # shared low-rank rep, then re-attach a broadcast rope channel.
-        assert self.q_proj is not None and self.kv_a_proj_with_mqa is not None and self.kv_a_layernorm is not None and self.kv_b_proj is not None
+        assert (
+            self.q_proj is not None
+            and self.kv_a_proj_with_mqa is not None
+            and self.kv_a_layernorm is not None
+            and self.kv_b_proj is not None
+        )
         q = self.q_proj(hidden_states).view(bsz, seqlen, self.local_heads, self.head_dim)
         q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         kv_a = self.kv_a_proj_with_mqa(hidden_states)
@@ -752,7 +800,9 @@ class BailingLinearAttention(nn.Module):
         self.linear_scale = config.linear_scale
         self.linear_silu = config.linear_silu
         # Fused QKV projection. ``g_proj`` produces the output gate.
-        self.query_key_value = ColumnParallelLinear(config.hidden_size, self.num_qkv_heads * self.head_dim, bias=config.qkv_bias)
+        self.query_key_value = ColumnParallelLinear(
+            config.hidden_size, self.num_qkv_heads * self.head_dim, bias=config.qkv_bias
+        )
         self.dense = RowParallelLinear(self.num_heads * self.head_dim, config.hidden_size, bias=config.use_bias)
         self.g_proj = ColumnParallelLinear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.group_norm_size = config.group_norm_size
@@ -784,15 +834,34 @@ class BailingLinearAttention(nn.Module):
             is_neox_style=True,
         )
         if config.linear_backend != "seg_la":
-            raise ValueError(f"BailingMoeV2_5ForCausalLM expects linear_backend='seg_la', got {config.linear_backend!r}")
+            raise ValueError(
+                f"BailingMoeV2_5ForCausalLM expects linear_backend='seg_la', got {config.linear_backend!r}"
+            )
         # Per-head decay slope (ALiBi-like, head- and layer-dependent) used as
         # the gating factor in the recurrent state update.
-        self.register_buffer("slope", _build_slope_tensor(self.local_heads, config.num_attention_heads, layer_idx, config.num_hidden_layers, ctx.rank, ctx.world_size), persistent=False)
+        self.register_buffer(
+            "slope",
+            _build_slope_tensor(
+                self.local_heads,
+                config.num_attention_heads,
+                layer_idx,
+                config.num_hidden_layers,
+                ctx.rank,
+                ctx.world_size,
+            ),
+            persistent=False,
+        )
         # Recurrent state cache populated at engine setup; shape is
         # ``[num_slots, local_heads, head_dim, head_dim]``.
         self.state_cache = torch.tensor([])
 
-    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, train_meta: TrainMeta | None, infer_meta: InferMeta | None) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        train_meta: TrainMeta | None,
+        infer_meta: InferMeta | None,
+    ) -> torch.Tensor:
         bsz, seqlen, _ = hidden_states.shape
         qkv = self.query_key_value(hidden_states)
         if self.linear_silu:
@@ -818,7 +887,9 @@ class BailingLinearAttention(nn.Module):
             out = self.g_norm(out) * _areno_sigmoid_no_compile(gate)
         return self.dense(out.to(hidden_states.dtype))
 
-    def _forward_train(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, train_meta: TrainMeta | None) -> torch.Tensor:
+    def _forward_train(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, train_meta: TrainMeta | None
+    ) -> torch.Tensor:
         # Packed sequences need ``cu_seqlens`` so the chunked kernel can
         # respect document boundaries; otherwise fall back to dense path.
         if train_meta is None or not train_meta.packed or train_meta.cu_seqlens is None:
@@ -829,7 +900,9 @@ class BailingLinearAttention(nn.Module):
     def _forward_full(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         return self._forward_lightning(q, k, v, cu_seqlens=None)
 
-    def _forward_lightning(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor | None) -> torch.Tensor:
+    def _forward_lightning(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor | None
+    ) -> torch.Tensor:
         log_once("chunk_lightning_attn", "using chunk lightning attention training kernel")
         k = k.to(dtype=q.dtype)
         v = v.to(dtype=q.dtype)
@@ -879,7 +952,9 @@ class BailingLinearAttention(nn.Module):
         out = self._forward_seg_la(q_flat, k_flat, v_flat, self.state_cache, slots.to(torch.int32), q_offsets, s_scales)
         return out.view_as(q)
 
-    def _forward_prefill(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, slots: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    def _forward_prefill(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, slots: torch.Tensor, cu_seqlens: torch.Tensor
+    ) -> torch.Tensor:
         q_flat = q.reshape(-1, self.local_heads, self.head_dim)
         k_flat = k.reshape(-1, self.local_heads, self.head_dim)
         v_flat = v.reshape(-1, self.local_heads, self.head_dim)
@@ -978,10 +1053,18 @@ class BailingDecoderLayer(nn.Module):
             else BailingDenseMLP(config, config.intermediate_size)
         )
 
-    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor, train_meta: TrainMeta | None, infer_meta: InferMeta | None) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        train_meta: TrainMeta | None,
+        infer_meta: InferMeta | None,
+    ) -> torch.Tensor:
         # Standard pre-norm residual: norm -> sublayer -> add.
         residual = hidden_states
-        hidden_states = residual + self.attention(self.input_layernorm(hidden_states), position_ids, train_meta, infer_meta)
+        hidden_states = residual + self.attention(
+            self.input_layernorm(hidden_states), position_ids, train_meta, infer_meta
+        )
         residual = hidden_states
         return residual + self.mlp(self.post_attention_layernorm(hidden_states))
 
@@ -997,7 +1080,13 @@ class BailingMoeLinearV2ForCausalLM(nn.Module):
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = VocabParallelLMHead(config.hidden_size, config.vocab_size, dtype=config.dtype)
 
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None, train_meta: TrainMeta | None = None, infer_meta: InferMeta | None = None) -> CausalLMOutput:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        train_meta: TrainMeta | None = None,
+        infer_meta: InferMeta | None = None,
+    ) -> CausalLMOutput:
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand_as(input_ids)
         hidden_states = self.word_embeddings(input_ids)
@@ -1071,7 +1160,9 @@ class BailingMoeLinearV2ForCausalLM(nn.Module):
             if isinstance(layer.mlp, BailingSparseMoeBlock):
                 layer.mlp.gate.finalize_expert_bias(tp_group, dp_group)
 
-    def allocate_kv_caches(self, num_blocks: int, block_size: int, device: torch.device) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    def allocate_kv_caches(
+        self, num_blocks: int, block_size: int, device: torch.device
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Allocate paged KV caches — only for softmax-attention layers."""
         caches = []
         for layer in self.layers:
@@ -1170,7 +1261,9 @@ class BailingMoeLinearV2Adapter(ModelAdapter):
         num_experts_per_tok = int(hf_config.get("num_experts_per_tok", hf_config.get("moe_router_topk", 1)))
         n_group = int(hf_config.get("n_group", hf_config.get("moe_router_num_groups", 1)))
         topk_group = int(hf_config.get("topk_group", hf_config.get("moe_router_group_topk", 1)))
-        routed_scaling_factor = float(hf_config.get("routed_scaling_factor", hf_config.get("moe_router_topk_scaling_factor", 1.0)))
+        routed_scaling_factor = float(
+            hf_config.get("routed_scaling_factor", hf_config.get("moe_router_topk_scaling_factor", 1.0))
+        )
         shared_size = hf_config.get("moe_shared_expert_intermediate_size")
         num_shared_experts = hf_config.get("num_shared_experts")
         if shared_size is not None and num_shared_experts is None:
@@ -1179,7 +1272,9 @@ class BailingMoeLinearV2Adapter(ModelAdapter):
             num_shared_experts = max(1, int(shared_size) // max(1, moe_intermediate_size))
         linear_backend = str(hf_config.get("linear_backend", "seg_la")).lower()
         score_function = str(
-            hf_config.get("score_function", hf_config.get("scoring_func", hf_config.get("moe_router_score_function", "sigmoid")))
+            hf_config.get(
+                "score_function", hf_config.get("scoring_func", hf_config.get("moe_router_score_function", "sigmoid"))
+            )
         ).lower()
         topk_method = str(hf_config.get("topk_method", "noaux_tc")).lower()
         moe_router_enable_expert_bias = _parse_bool(hf_config.get("moe_router_enable_expert_bias"), True)
@@ -1188,7 +1283,9 @@ class BailingMoeLinearV2Adapter(ModelAdapter):
         if score_function != "sigmoid":
             raise ValueError(f"BailingMoeLinearV2 only supports score_function='sigmoid', got {score_function!r}")
         if not moe_router_enable_expert_bias:
-            raise ValueError("BailingMoeLinearV2 requires moe_router_enable_expert_bias=True to match SGLang biased grouped topk")
+            raise ValueError(
+                "BailingMoeLinearV2 requires moe_router_enable_expert_bias=True to match SGLang biased grouped topk"
+            )
         if not norm_topk_prob:
             raise ValueError("BailingMoeLinearV2 requires norm_topk_prob=True to match SGLang TopK renormalize")
         if topk_method not in {"noaux_tc", "group_limited_greedy"}:
@@ -1226,7 +1323,11 @@ class BailingMoeLinearV2Adapter(ModelAdapter):
             moe_router_dtype=moe_router_dtype,
             score_function=score_function,
             topk_method=topk_method,
-            group_norm_size=int(hf_config.get("group_norm_size", hf_config.get("linear_attn_norm_group_size", hf_config.get("head_dim", 128)))),
+            group_norm_size=int(
+                hf_config.get(
+                    "group_norm_size", hf_config.get("linear_attn_norm_group_size", hf_config.get("head_dim", 128))
+                )
+            ),
             num_nextn_predict_layers=int(hf_config.get("num_nextn_predict_layers", 0)),
             mtp_loss_scaling_factor=float(hf_config.get("mtp_loss_scaling_factor", 0.0)),
             qk_nope_head_dim=int(hf_config.get("qk_nope_head_dim", head_dim)),
@@ -1265,7 +1366,10 @@ def _is_softmax_layer(config: ModelConfig, layer_idx: int) -> bool:
     layer_group_size) are also forced to softmax so attention always anchors
     the sequence end.
     """
-    return (layer_idx + 1) % config.layer_group_size == 0 or layer_idx >= config.num_hidden_layers // config.layer_group_size * config.layer_group_size
+    return (
+        (layer_idx + 1) % config.layer_group_size == 0
+        or layer_idx >= config.num_hidden_layers // config.layer_group_size * config.layer_group_size
+    )
 
 
 def _build_slope_tensor(
@@ -1283,6 +1387,7 @@ def _build_slope_tensor(
     decay so deeper layers attenuate slightly more slowly. The slice for
     this rank is the standard TP shard of the full per-head table.
     """
+
     def get_slopes(n: int) -> list[float]:
         def get_slopes_power_of_2(m: int) -> list[float]:
             start = 2 ** (-(2 ** -(math.log2(m) - 3)))
@@ -1293,7 +1398,10 @@ def _build_slope_tensor(
         # Non-power-of-two head counts: take the next-smaller power-of-two
         # slopes and interleave the doubled sequence to fill the rest.
         closest_power_of_2 = 2 ** math.floor(math.log2(n))
-        return get_slopes_power_of_2(closest_power_of_2) + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+        return (
+            get_slopes_power_of_2(closest_power_of_2)
+            + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+        )
 
     if total_heads != local_heads * world_size:
         raise ValueError(f"total_heads={total_heads} must equal local_heads * world_size={local_heads * world_size}")

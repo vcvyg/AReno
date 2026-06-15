@@ -172,7 +172,9 @@ class _VocabParallelSelectedLogprobs(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, logits_shard: torch.Tensor, labels: torch.Tensor, vocab_start: int, group, world_size: int) -> torch.Tensor:
+    def forward(
+        ctx, logits_shard: torch.Tensor, labels: torch.Tensor, vocab_start: int, group, world_size: int
+    ) -> torch.Tensor:
         out, probs, safe_labels, local_mask = _selected_logprobs_components(
             logits_shard,
             labels,

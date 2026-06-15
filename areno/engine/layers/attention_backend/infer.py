@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from torch import nn
 
 from areno.engine.layers.attention_backend.common import (
     build_attention_call,
@@ -123,7 +123,9 @@ class FlashAttnInferBackend(nn.Module):
                 return out.view(q.shape[0], q.shape[1], q.shape[2], call.value_dim)
             # When value head dim < cache head dim we pad to match the cache
             # layout that was sized to the QK head dim at prefill time.
-            v_update = pad_last_dim(v_flat, v_cache_dim).unsqueeze(1) if v_cache_dim != call.value_dim else v_flat.unsqueeze(1)
+            v_update = (
+                pad_last_dim(v_flat, v_cache_dim).unsqueeze(1) if v_cache_dim != call.value_dim else v_flat.unsqueeze(1)
+            )
             cache_seqlens = meta.cache_seqlens if update_cache else meta.cache_seqlens + 1
             k_update = k_flat.unsqueeze(1) if update_cache else None
             v_update = v_update if update_cache else None

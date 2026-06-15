@@ -26,11 +26,10 @@ from functools import partial
 import numpy as np
 
 import areno.api
-from areno.api.trainers.policy_only import PolicyOnlyTrainer
 from areno.api.advantages import compute_gae
 from areno.api.rewards import make_reward_record
 from areno.api.roles import MissingRoleCapability, ModelRole
-
+from areno.api.trainers.policy_only import PolicyOnlyTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -309,7 +308,11 @@ class PPOTrainer(PolicyOnlyTrainer):
             if len(action_old_logprobs) != resp_len:
                 raise ValueError("actor returned misaligned old logprobs")
             row_rollout_logprobs = rollout_row[prefix_len : prefix_len + resp_len]
-            rollout_logprobs.extend(lp for lp, is_loss in zip(row_rollout_logprobs, loss_mask[prefix_len : prefix_len + resp_len], strict=True) if is_loss)
+            rollout_logprobs.extend(
+                lp
+                for lp, is_loss in zip(row_rollout_logprobs, loss_mask[prefix_len : prefix_len + resp_len], strict=True)
+                if is_loss
+            )
             old_logprobs_all.extend(action_old_logprobs)
             logp_diff_all.extend(
                 float(old_logprob) - float(rollout_logprob)
@@ -481,8 +484,7 @@ def _normalize_response_advantages(train_batch) -> None:
     for seq in train_batch:
         mask = seq.loss_mask if getattr(seq, "loss_mask", None) else [not item for item in seq.prompt_mask]
         seq.advantages = [
-            (adv - mean) / scale if is_loss else 0.0
-            for adv, is_loss in zip(seq.advantages, mask, strict=True)
+            (adv - mean) / scale if is_loss else 0.0 for adv, is_loss in zip(seq.advantages, mask, strict=True)
         ]
 
 

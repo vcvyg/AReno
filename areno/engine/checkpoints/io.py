@@ -16,17 +16,17 @@ import json
 import os
 import shutil
 import zlib
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from areno.engine.parallel.context import get_tp_context
 from areno.engine.layers.linear import _shard_range
+from areno.engine.parallel.context import get_tp_context
 
 _ASYNC_CPU_COPY_MAX_BYTES = 2 * 1024**3
 _PENDING_CPU_COPY_BUCKETS: list[tuple[torch.cuda.Stream, int, torch.Tensor]] = []
@@ -203,9 +203,7 @@ def resolve_model_path(model: str | None) -> str | None:
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
-        raise RuntimeError(
-            f"{model!r} is not a local path and huggingface_hub is unavailable"
-        ) from exc
+        raise RuntimeError(f"{model!r} is not a local path and huggingface_hub is unavailable") from exc
     return snapshot_download(model)
 
 
@@ -296,7 +294,9 @@ class SafetensorsIndex:
             return
         workers = min(self.max_workers, len(grouped))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(self._load_file_keys, filename, file_keys) for filename, file_keys in grouped.items()]
+            futures = [
+                pool.submit(self._load_file_keys, filename, file_keys) for filename, file_keys in grouped.items()
+            ]
             for future in as_completed(futures):
                 loaded = future.result()
                 self._cache.update(loaded)
@@ -451,7 +451,9 @@ def _copy_vocab_shard(dst: torch.Tensor, src: torch.Tensor, rank: int, world_siz
     dst.copy_(src[start:end].to(dtype=dst.dtype))
 
 
-def _copy_optional_column_bias(dst: torch.Tensor | None, index: SafetensorsIndex, key: str, rank: int, world_size: int) -> None:
+def _copy_optional_column_bias(
+    dst: torch.Tensor | None, index: SafetensorsIndex, key: str, rank: int, world_size: int
+) -> None:
     """Copy a column-bias slice only when both dst and the HF key are present."""
 
     if dst is None or key not in index.weight_map:
@@ -577,7 +579,9 @@ def rank0_tensor(tensor: torch.Tensor) -> _CheckpointTensorTask | None:
     return _ReplicatedTensorTask(tensor) if ctx.dp_rank == 0 else None
 
 
-def write_hf_safetensors_checkpoint(tensors: dict[str, torch.Tensor | None], output_path: str | Path, source_path: str | Path | None) -> str | None:
+def write_hf_safetensors_checkpoint(
+    tensors: dict[str, torch.Tensor | None], output_path: str | Path, source_path: str | Path | None
+) -> str | None:
     """Write a sharded HF safetensors checkpoint plus its index.json.
 
     Each TP rank writes the tensors it owns into `model-{rank+1:05d}-of-{N:05d}.safetensors`.
@@ -602,7 +606,9 @@ def write_hf_safetensors_checkpoint(tensors: dict[str, torch.Tensor | None], out
         _copy_hf_assets(Path(source_path), path)
     # Drop None entries (tensors owned by a different rank) before writing.
     final_tensors = {key: tensor for key, tensor in tensors.items() if tensor is not None}
-    filename = "model.safetensors" if ctx.world_size == 1 else f"model-{ctx.rank + 1:05d}-of-{ctx.world_size:05d}.safetensors"
+    filename = (
+        "model.safetensors" if ctx.world_size == 1 else f"model-{ctx.rank + 1:05d}-of-{ctx.world_size:05d}.safetensors"
+    )
     if final_tensors:
         save_file(final_tensors, path / filename, metadata={"format": "pt"})
 

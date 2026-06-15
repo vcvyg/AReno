@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import unittest
 import asyncio
+import unittest
 
-from areno.api.trainer import Trainer
 import areno.api.trainer as trainer_mod
 from areno.api.context import Context
 from areno.api.models import SamplingParams
-
+from areno.api.trainer import Trainer
 from tests.helpers import PatchedContext
 
 

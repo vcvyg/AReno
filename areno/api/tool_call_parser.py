@@ -156,8 +156,7 @@ class MiniCPMToolCallParser(JsonToolCallParser):
             if not _tool_name_allowed(name, tools, tool_choice):
                 continue
             args = {
-                key.strip(): _parse_minicpm_param_value(value.strip())
-                for key, value in self._param_re.findall(body)
+                key.strip(): _parse_minicpm_param_value(value.strip()) for key, value in self._param_re.findall(body)
             }
             calls.append(_openai_tool_call(name.strip(), args))
         if calls:

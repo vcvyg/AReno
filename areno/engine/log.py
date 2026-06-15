@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import os
 
-
 _DEFAULT_FORMAT = "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d - %(message)s"
 _DEFAULT_DATEFMT = "%Y-%m-%d %H:%M:%S"
 

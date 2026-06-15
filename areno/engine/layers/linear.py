@@ -100,7 +100,11 @@ class ColumnParallelLinear(nn.Module):
         # In sequence-parallel mode the activation is sharded along the
         # sequence dim, so we all-gather it back to the full sequence before
         # the matmul; otherwise we just copy through the TP region.
-        x = gather_from_sequence_parallel_region(x) if is_sequence_parallel_active() else copy_to_tensor_parallel_region(x)
+        x = (
+            gather_from_sequence_parallel_region(x)
+            if is_sequence_parallel_active()
+            else copy_to_tensor_parallel_region(x)
+        )
         out = _areno_linear_forward(x, self.weight, self.bias)
         if self.gather_output:
             # Concatenate column-shards along the last dim to recover the
@@ -146,7 +150,11 @@ class MergedColumnParallelLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = gather_from_sequence_parallel_region(x) if is_sequence_parallel_active() else copy_to_tensor_parallel_region(x)
+        x = (
+            gather_from_sequence_parallel_region(x)
+            if is_sequence_parallel_active()
+            else copy_to_tensor_parallel_region(x)
+        )
         return _areno_linear_forward(x, self.weight, self.bias)
 
 

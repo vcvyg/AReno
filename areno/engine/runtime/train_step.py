@@ -19,8 +19,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from areno.engine.runtime.metadata import TrainMeta
 from areno.engine.parallel.context import get_tp_context
+from areno.engine.runtime.metadata import TrainMeta
 
 
 def _metrics_to_float(metrics: dict[str, Any] | None) -> dict[str, float] | None:

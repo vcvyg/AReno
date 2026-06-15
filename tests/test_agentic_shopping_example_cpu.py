@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-
 EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "agentic" / "shopping"
 
 

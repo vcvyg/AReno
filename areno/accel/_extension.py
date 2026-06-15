@@ -7,6 +7,7 @@ Python shims are needed (e.g. for type checking). Each shim calls
 kernel. There is no pure-Python fallback: if the extension was not built the
 ``importlib.import_module`` call below raises ``ModuleNotFoundError``.
 """
+
 from __future__ import annotations
 
 import importlib

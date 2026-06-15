@@ -3,7 +3,12 @@ from __future__ import annotations
 import unittest
 
 from areno.api import metrics as metrics_mod
-from areno.api.metrics import MetricsRecorder, collect_train_batch_stats, init_rollout_stats, record_rollout_sequence_stats
+from areno.api.metrics import (
+    MetricsRecorder,
+    collect_train_batch_stats,
+    init_rollout_stats,
+    record_rollout_sequence_stats,
+)
 from areno.api.models import TrainSequence
 
 

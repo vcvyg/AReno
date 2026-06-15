@@ -1,14 +1,17 @@
-import importlib.util
 import asyncio
+import importlib.util
 import logging
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import torch
-
-from areno.api.tool_call_parser import Gemma4ToolCallParser, JsonToolCallParser, MiniCPMToolCallParser, QwenToolCallParser
+from areno.api.tool_call_parser import (
+    Gemma4ToolCallParser,
+    JsonToolCallParser,
+    MiniCPMToolCallParser,
+    QwenToolCallParser,
+)
 from areno.api.trainers.policy_only import PolicyOnlyTrainer
 
 
@@ -29,7 +32,9 @@ RolloutSession = agentic.RolloutSession
 
 
 def test_agent_batch_expands_records_by_n_samples():
-    batch = AgentBatch(records=[{"prompt": "p0"}, {"prompt": "p1"}], prompts=["p0", "p1"], input_tokens=[[1], [2]], n_samples=2)
+    batch = AgentBatch(
+        records=[{"prompt": "p0"}, {"prompt": "p1"}], prompts=["p0", "p1"], input_tokens=[[1], [2]], n_samples=2
+    )
 
     items = list(batch.iter_samples())
 
@@ -78,7 +83,9 @@ def test_agentic_train_rows_train_tool_call_tokens_by_default():
 
 
 def test_tool_call_loss_mask_stops_before_tool_response_sentinel():
-    tokenizer = _PieceTokenizer(["<|tool_call>", "call:choose_square", "{square:5}", "<tool_call|>", "<|tool_response>", "<eos>"])
+    tokenizer = _PieceTokenizer(
+        ["<|tool_call>", "call:choose_square", "{square:5}", "<tool_call|>", "<|tool_response>", "<eos>"]
+    )
 
     mask = agentic._tool_call_loss_mask(tokenizer, [0, 1, 2, 3, 4, 5])
 
@@ -109,7 +116,9 @@ def test_agentic_train_rows_keep_assistant_text_tokens_trainable():
 
 
 def test_agent_trajectory_turn_extracts_response_metadata():
-    item = next(AgentBatch(records=[{"task": "same"}], prompts=["same prompt"], input_tokens=[[1]], n_samples=1).iter_samples())
+    item = next(
+        AgentBatch(records=[{"task": "same"}], prompts=["same prompt"], input_tokens=[[1]], n_samples=1).iter_samples()
+    )
     turn = AgentTrajectoryTurn(
         item=item,
         messages=[{"role": "user", "content": "same prompt"}],
@@ -140,7 +149,9 @@ def test_normalize_messages_rewrites_null_tool_call_content_for_templates():
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "choose_square", "arguments": "{}"}}],
+                "tool_calls": [
+                    {"id": "call-1", "type": "function", "function": {"name": "choose_square", "arguments": "{}"}}
+                ],
             },
             {"role": "tool", "tool_call_id": "call-1", "content": "{}"},
         ]
@@ -164,7 +175,9 @@ def test_explicit_trajectory_tokenization_normalizes_null_tool_call_content():
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "choose_square", "arguments": "{}"}}],
+                "tool_calls": [
+                    {"id": "call-1", "type": "function", "function": {"name": "choose_square", "arguments": "{}"}}
+                ],
             },
             {"role": "tool", "tool_call_id": "call-1", "content": "{}"},
         ],
@@ -382,7 +395,9 @@ def test_proxy_client_cancellation_does_not_cancel_queued_rollout():
 
     async def run():
         session._loop = asyncio.get_running_loop()
-        task = asyncio.create_task(session._complete_chat({"model": "policy", "messages": [{"role": "user", "content": "p0"}]}))
+        task = asyncio.create_task(
+            session._complete_chat({"model": "policy", "messages": [{"role": "user", "content": "p0"}]})
+        )
         await asyncio.sleep(0)
         task.cancel()
         try:
@@ -463,9 +478,12 @@ def test_proxy_filters_prompt_exceeding_max_sequence_len_without_rollout():
         loss_mask_policy=LossMaskPolicy(),
         max_running_prompts=1,
     )
+
     async def run():
         session._loop = asyncio.get_running_loop()
-        return await session._complete_chat({"model": "policy", "messages": [{"role": "user", "content": "long prompt"}]})
+        return await session._complete_chat(
+            {"model": "policy", "messages": [{"role": "user", "content": "long prompt"}]}
+        )
 
     response = asyncio.run(run())
 
@@ -557,16 +575,32 @@ def test_agentic_interleaved_trajectories_do_not_cross_items():
         ).iter_samples()
     )
     turns = [
-        AgentTrajectoryTurn(items[0], messages=[{"role": "user", "content": "a-1"}], response={"areno": {"response_tokens": [10], "response_logprobs": [-0.1]}}),
-        AgentTrajectoryTurn(items[1], messages=[{"role": "user", "content": "b-1"}], response={"areno": {"response_tokens": [20], "response_logprobs": [-0.2]}}),
         AgentTrajectoryTurn(
             items[0],
-            messages=[{"role": "user", "content": "a-1"}, {"role": "assistant", "content": "10"}, {"role": "user", "content": "a-2"}],
+            messages=[{"role": "user", "content": "a-1"}],
+            response={"areno": {"response_tokens": [10], "response_logprobs": [-0.1]}},
+        ),
+        AgentTrajectoryTurn(
+            items[1],
+            messages=[{"role": "user", "content": "b-1"}],
+            response={"areno": {"response_tokens": [20], "response_logprobs": [-0.2]}},
+        ),
+        AgentTrajectoryTurn(
+            items[0],
+            messages=[
+                {"role": "user", "content": "a-1"},
+                {"role": "assistant", "content": "10"},
+                {"role": "user", "content": "a-2"},
+            ],
             response={"areno": {"response_tokens": [11], "response_logprobs": [-0.11]}},
         ),
         AgentTrajectoryTurn(
             items[1],
-            messages=[{"role": "user", "content": "b-1"}, {"role": "assistant", "content": "20"}, {"role": "user", "content": "b-2"}],
+            messages=[
+                {"role": "user", "content": "b-1"},
+                {"role": "assistant", "content": "20"},
+                {"role": "user", "content": "b-2"},
+            ],
             response={"areno": {"response_tokens": [21], "response_logprobs": [-0.21]}},
         ),
     ]
@@ -624,7 +658,10 @@ def test_agentic_tool_request_returns_tool_call_and_reward_record():
             "type": "function",
             "function": {
                 "name": "choose_move",
-                "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["left", "right"]}}},
+                "parameters": {
+                    "type": "object",
+                    "properties": {"direction": {"type": "string", "enum": ["left", "right"]}},
+                },
             },
         }
     ]
@@ -649,7 +686,10 @@ def test_json_tool_call_parser_prefers_explicit_final_direction():
             "type": "function",
             "function": {
                 "name": "choose_move",
-                "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}}},
+                "parameters": {
+                    "type": "object",
+                    "properties": {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}},
+                },
             },
         }
     ]
@@ -670,7 +710,10 @@ def test_json_tool_call_parser_rejects_plain_reasoning_without_action():
             "type": "function",
             "function": {
                 "name": "choose_move",
-                "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}}},
+                "parameters": {
+                    "type": "object",
+                    "properties": {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}},
+                },
             },
         }
     ]
@@ -691,7 +734,10 @@ def test_qwen_tool_call_parser_supports_chat_completions_tools():
             "type": "function",
             "function": {
                 "name": "choose_move",
-                "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["left", "right"]}}},
+                "parameters": {
+                    "type": "object",
+                    "properties": {"direction": {"type": "string", "enum": ["left", "right"]}},
+                },
             },
         }
     ]
@@ -713,7 +759,10 @@ def test_gemma4_tool_call_parser_supports_chat_completions_tools():
             "type": "function",
             "function": {
                 "name": "choose_move",
-                "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["left", "right"]}}},
+                "parameters": {
+                    "type": "object",
+                    "properties": {"direction": {"type": "string", "enum": ["left", "right"]}},
+                },
             },
         }
     ]
@@ -735,7 +784,10 @@ def test_minicpm_tool_call_parser_supports_xml_function_calls():
             "type": "function",
             "function": {
                 "name": "choose_square",
-                "parameters": {"type": "object", "properties": {"square": {"type": "integer", "minimum": 1, "maximum": 9}}},
+                "parameters": {
+                    "type": "object",
+                    "properties": {"square": {"type": "integer", "minimum": 1, "maximum": 9}},
+                },
             },
         }
     ]
@@ -757,7 +809,10 @@ def test_minicpm_tool_call_parser_supports_v46_tool_call_blocks():
             "type": "function",
             "function": {
                 "name": "choose_square",
-                "parameters": {"type": "object", "properties": {"square": {"type": "integer", "minimum": 1, "maximum": 9}}},
+                "parameters": {
+                    "type": "object",
+                    "properties": {"square": {"type": "integer", "minimum": 1, "maximum": 9}},
+                },
             },
         }
     ]
@@ -785,7 +840,10 @@ def test_tool_call_parser_supports_flat_tool_schema():
         {
             "type": "function",
             "name": "choose_move",
-            "parameters": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["left", "right"]}}},
+            "parameters": {
+                "type": "object",
+                "properties": {"direction": {"type": "string", "enum": ["left", "right"]}},
+            },
         }
     ]
 
@@ -805,7 +863,10 @@ def test_json_tool_call_parser_rejects_tool_choice_mismatch():
             "type": "function",
             "function": {
                 "name": "submit_bundle",
-                "parameters": {"type": "object", "properties": {"item_ids": {"type": "array", "items": {"type": "string"}}}},
+                "parameters": {
+                    "type": "object",
+                    "properties": {"item_ids": {"type": "array", "items": {"type": "string"}}},
+                },
             },
         }
     ]

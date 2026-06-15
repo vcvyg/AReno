@@ -16,16 +16,25 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from areno.accel import (
+    areno_linear,
+    areno_topk_softmax,
+)
+from areno.accel.ops import FusedMoeConfig, areno_fused_experts, areno_silu_and_mul, log_once
 from areno.engine.config import ModelConfig, _parse_dtype
 from areno.engine.layers.attention_backend.infer import FlashAttnInferBackend, build_infer_attention_backend
 from areno.engine.layers.attention_backend.train import build_train_attention_backend
-from areno.engine.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear, _shard_range, mark_tensor_parallel_parameter
+from areno.engine.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+    _shard_range,
+    mark_tensor_parallel_parameter,
+)
 from areno.engine.layers.mlp import GatedMLP
 from areno.engine.layers.norm import RMSNorm
 from areno.engine.layers.rotary import PartialRotaryEmbedding
 from areno.engine.layers.vocab import VocabParallelEmbedding, VocabParallelLMHead
-from areno.models.base import CausalLMOutput, ModelAdapter
-from areno.accel.ops import FusedMoeConfig, areno_silu_and_mul, areno_fused_experts, log_once
 from areno.engine.parallel.collectives import (
     all_reduce,
     copy_to_tensor_parallel_region,
@@ -37,7 +46,6 @@ from areno.engine.parallel.collectives import (
 from areno.engine.parallel.context import get_tp_context
 from areno.engine.runtime.metadata import InferMeta, TrainMeta
 from areno.engine.runtime.recompute import checkpoint_layer
-from areno.models.qwen3.model import Qwen3MoeExperts
 from areno.models._shared.dynamo_wrappers import (
     _areno_depthwise_causal_conv1d_silu_decode_no_compile,
     _areno_depthwise_causal_conv1d_silu_no_compile,
@@ -50,11 +58,8 @@ from areno.models._shared.dynamo_wrappers import (
     _fla_fused_recurrent_gated_delta_rule_no_compile,
     _require_fla_gdn,
 )
-from areno.accel import (
-    areno_linear,
-    areno_topk_softmax,
-)
-
+from areno.models.base import CausalLMOutput, ModelAdapter
+from areno.models.qwen3.model import Qwen3MoeExperts
 
 _REPLICATED_KV_GROUPS: dict[tuple[int, int, int, int, int], tuple[dist.ProcessGroup | None, int]] = {}
 
@@ -107,7 +112,9 @@ class Qwen35FullAttention(nn.Module):
                 attn_output_gate=self.attn_output_gate,
             )
         else:
-            raise ValueError("Qwen3.5 full attention requires num_key_value_heads to divide TP or TP to divide into replicated KV groups")
+            raise ValueError(
+                "Qwen3.5 full attention requires num_key_value_heads to divide TP or TP to divide into replicated KV groups"
+            )
         self.local_kv_heads = self.qkv_proj.local_out_features[1] // self.head_dim
         self.o_proj = RowParallelLinear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
         self.q_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
@@ -147,13 +154,19 @@ class Qwen35FullAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         q, k = self.rope(q, k, position_ids)
-        out = self._forward_infer(q, k, v, infer_meta) if infer_meta is not None else self._forward_train(q, k, v, train_meta)
+        out = (
+            self._forward_infer(q, k, v, infer_meta)
+            if infer_meta is not None
+            else self._forward_train(q, k, v, train_meta)
+        )
         out = out.contiguous().view(batch, seqlen, q_size)
         if gate is not None:
             out = out * _areno_sigmoid_no_compile(gate)
         return self.o_proj(out)
 
-    def _forward_train(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, train_meta: TrainMeta | None) -> torch.Tensor:
+    def _forward_train(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, train_meta: TrainMeta | None
+    ) -> torch.Tensor:
         return self.train_backend(q, k, v, train_meta)
 
     def _forward_infer(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, infer_meta: InferMeta) -> torch.Tensor:
@@ -207,7 +220,11 @@ class Qwen35ReplicatedKVQKVLinear(nn.Module):
         self.weight.register_hook(self._sync_replicated_kv_grad)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = gather_from_sequence_parallel_region(x) if is_sequence_parallel_active() else copy_to_tensor_parallel_region(x)
+        x = (
+            gather_from_sequence_parallel_region(x)
+            if is_sequence_parallel_active()
+            else copy_to_tensor_parallel_region(x)
+        )
         return _areno_linear_no_compile(x, self.weight)
 
     def _sync_replicated_kv_grad(self, grad: torch.Tensor) -> torch.Tensor:
@@ -243,8 +260,12 @@ class Qwen35GatedDeltaNet(nn.Module):
             (self.key_dim, self.key_dim, self.value_dim, self.value_dim),
             bias=False,
         )
-        self.in_proj_ba = MergedColumnParallelLinear(config.hidden_size, (self.num_value_heads, self.num_value_heads), bias=False)
-        self.conv1d_weight = nn.Parameter(torch.empty(self.local_key_dim * 2 + self.local_value_dim, 1, self.conv_kernel_size))
+        self.in_proj_ba = MergedColumnParallelLinear(
+            config.hidden_size, (self.num_value_heads, self.num_value_heads), bias=False
+        )
+        self.conv1d_weight = nn.Parameter(
+            torch.empty(self.local_key_dim * 2 + self.local_value_dim, 1, self.conv_kernel_size)
+        )
         mark_tensor_parallel_parameter(self.conv1d_weight, True, sequence_parallel=True)
         self.dt_bias = nn.Parameter(torch.empty(self.local_value_heads))
         self.A_log = nn.Parameter(torch.empty(self.local_value_heads, dtype=torch.float32))
@@ -268,7 +289,9 @@ class Qwen35GatedDeltaNet(nn.Module):
         batch, seqlen, _ = hidden_states.shape
         qkvz = self.in_proj_qkvz(hidden_states)
         ba = self.in_proj_ba(hidden_states)
-        mixed_qkv = self._causal_conv(qkvz[..., : self.local_key_dim * 2 + self.local_value_dim], train_meta, infer_meta)
+        mixed_qkv = self._causal_conv(
+            qkvz[..., : self.local_key_dim * 2 + self.local_value_dim], train_meta, infer_meta
+        )
         query_key, value = mixed_qkv.split((self.local_key_dim * 2, self.local_value_dim), dim=-1)
         z = qkvz[..., self.local_key_dim * 2 + self.local_value_dim :]
         b_gate, a_gate = ba.split((self.local_value_heads, self.local_value_heads), dim=-1)
@@ -279,7 +302,9 @@ class Qwen35GatedDeltaNet(nn.Module):
         if infer_meta is not None:
             out = self._forward_infer(query, key, value, a_gate, b_gate, infer_meta)
         else:
-            g = -self.A_log.float().exp().view(1, 1, -1) * F.softplus(a_gate.float() + self.dt_bias.float().view(1, 1, -1))
+            g = -self.A_log.float().exp().view(1, 1, -1) * F.softplus(
+                a_gate.float() + self.dt_bias.float().view(1, 1, -1)
+            )
             beta = torch.sigmoid(b_gate)
             out = self._forward_train(query, key, value, g, beta, train_meta)
         out = self._rmsnorm_gate(out, z).reshape(batch, seqlen, self.local_value_dim)
@@ -325,7 +350,9 @@ class Qwen35GatedDeltaNet(nn.Module):
         raise ValueError(f"unsupported inference mode: {infer_meta.mode}")
 
     @torch._dynamo.disable
-    def _causal_conv_infer_prefill(self, x: torch.Tensor, cu_seqlens: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    def _causal_conv_infer_prefill(
+        self, x: torch.Tensor, cu_seqlens: torch.Tensor, slots: torch.Tensor
+    ) -> torch.Tensor:
         out = torch.empty_like(x)
         cu = cu_seqlens.to(device=x.device, dtype=torch.long)
         for idx, slot in enumerate(slots):
@@ -347,15 +374,23 @@ class Qwen35GatedDeltaNet(nn.Module):
         beta: torch.Tensor,
         train_meta: TrainMeta | None,
     ) -> torch.Tensor:
-        cu = train_meta.cu_seqlens.to(device=q.device, dtype=torch.long) if train_meta is not None and train_meta.packed and train_meta.cu_seqlens is not None else None
+        cu = (
+            train_meta.cu_seqlens.to(device=q.device, dtype=torch.long)
+            if train_meta is not None and train_meta.packed and train_meta.cu_seqlens is not None
+            else None
+        )
         _require_fla_gdn()
         if cu is not None and q.shape[0] != 1:
             raise ValueError("FLA chunk gated-delta expects flattened packed input with batch size 1")
         log_once("qwen35_gdn_fla_chunk", "using FLA chunk gated-delta training kernel")
-        out, _ = _fla_chunk_gated_delta_rule_no_compile(q, k, v, g=g, beta=beta, scale=self.scale, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
+        out, _ = _fla_chunk_gated_delta_rule_no_compile(
+            q, k, v, g=g, beta=beta, scale=self.scale, cu_seqlens=cu, use_qk_l2norm_in_kernel=True
+        )
         return out
 
-    def _forward_infer(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, a: torch.Tensor, b: torch.Tensor, infer_meta: InferMeta) -> torch.Tensor:
+    def _forward_infer(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, a: torch.Tensor, b: torch.Tensor, infer_meta: InferMeta
+    ) -> torch.Tensor:
         if infer_meta.block_table is None:
             raise RuntimeError("Qwen3.5 GDN inference requires block_table")
         if self.state_cache.numel() == 0:
@@ -370,7 +405,9 @@ class Qwen35GatedDeltaNet(nn.Module):
             v = v.reshape(1, -1, self.local_value_heads, self.head_v_dim)
             a = a.reshape(1, -1, self.local_value_heads)
             b = b.reshape(1, -1, self.local_value_heads)
-            g = -self.A_log.float().exp().view(1, 1, -1) * _areno_softplus_no_compile(a.float() + self.dt_bias.float().view(1, 1, -1))
+            g = -self.A_log.float().exp().view(1, 1, -1) * _areno_softplus_no_compile(
+                a.float() + self.dt_bias.float().view(1, 1, -1)
+            )
             beta = _areno_sigmoid_no_compile(b)
             initial_state = self.state_cache.index_select(0, slots).to(device=q.device)
             out, state = _fla_fused_recurrent_gated_delta_rule_no_compile(
@@ -390,7 +427,9 @@ class Qwen35GatedDeltaNet(nn.Module):
         if cu is None:
             raise RuntimeError("Qwen3.5 GDN inference requires cu_seqlens")
         log_once("qwen35_gdn_fla_infer", "using FLA recurrent gated-delta inference kernel")
-        g = -self.A_log.float().exp().view(1, 1, -1) * _areno_softplus_no_compile(a.float() + self.dt_bias.float().view(1, 1, -1))
+        g = -self.A_log.float().exp().view(1, 1, -1) * _areno_softplus_no_compile(
+            a.float() + self.dt_bias.float().view(1, 1, -1)
+        )
         beta = _areno_sigmoid_no_compile(b)
         initial_state = self.state_cache.index_select(0, slots).to(device=q.device)
         out, state = _fla_fused_recurrent_gated_delta_rule_no_compile(
@@ -432,7 +471,11 @@ class Qwen35DecoderLayer(nn.Module):
         super().__init__()
         layer_type = (config.layer_types or ())[layer_idx]
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.attention = Qwen35FullAttention(config, layer_idx) if layer_type == "full_attention" else Qwen35GatedDeltaNet(config, layer_idx)
+        self.attention = (
+            Qwen35FullAttention(config, layer_idx)
+            if layer_type == "full_attention"
+            else Qwen35GatedDeltaNet(config, layer_idx)
+        )
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = GatedMLP(config)
 
@@ -444,7 +487,9 @@ class Qwen35DecoderLayer(nn.Module):
         infer_meta: InferMeta | None,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = residual + self.attention(self.input_layernorm(hidden_states), position_ids, train_meta, infer_meta)
+        hidden_states = residual + self.attention(
+            self.input_layernorm(hidden_states), position_ids, train_meta, infer_meta
+        )
         residual = hidden_states
         hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states
@@ -465,9 +510,13 @@ class Qwen35MoeMLP(nn.Module):
         self.experts = Qwen3MoeExperts(config)
         shared_size = int(config.shared_expert_intermediate_size or 0)
         self.shared_expert = Qwen35SharedExpert(config.hidden_size, shared_size) if shared_size > 0 else None
-        self.shared_expert_gate = nn.Parameter(torch.empty(config.hidden_size, dtype=config.dtype)) if shared_size > 0 else None
+        self.shared_expert_gate = (
+            nn.Parameter(torch.empty(config.hidden_size, dtype=config.dtype)) if shared_size > 0 else None
+        )
         if self.shared_expert_gate is not None:
-            mark_tensor_parallel_parameter(self.shared_expert_gate, False, sequence_parallel=False, tp_grad_allreduce=True)
+            mark_tensor_parallel_parameter(
+                self.shared_expert_gate, False, sequence_parallel=False, tp_grad_allreduce=True
+            )
         self.register_buffer("_infer_w1_weight", torch.empty(0), persistent=False)
         self.register_buffer("_infer_w2_weight", torch.empty(0), persistent=False)
         self._infer_weights_ready = False
@@ -643,8 +692,21 @@ class Qwen35ForCausalLM(nn.Module):
                 attn.set_kv_cache(*kv_caches[idx])
                 idx += 1
             else:
-                state = torch.zeros(num_slots, attn.local_value_heads, attn.head_k_dim, attn.head_v_dim, device=device, dtype=torch.float32)
-                conv = torch.zeros(num_slots, attn.local_key_dim * 2 + attn.local_value_dim, attn.conv_kernel_size - 1, device=device, dtype=self.config.dtype)
+                state = torch.zeros(
+                    num_slots,
+                    attn.local_value_heads,
+                    attn.head_k_dim,
+                    attn.head_v_dim,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                conv = torch.zeros(
+                    num_slots,
+                    attn.local_key_dim * 2 + attn.local_value_dim,
+                    attn.conv_kernel_size - 1,
+                    device=device,
+                    dtype=self.config.dtype,
+                )
                 attn.set_state_cache(state, conv)
 
     @torch.no_grad()
@@ -669,13 +731,29 @@ class Qwen35ForCausalLM(nn.Module):
         del tp_group, dp_group
         return None
 
-    def allocate_kv_caches(self, num_blocks: int, block_size: int, device: torch.device) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    def allocate_kv_caches(
+        self, num_blocks: int, block_size: int, device: torch.device
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         caches = []
         for layer in self.layers:
             attention = layer.attention
             if isinstance(attention, Qwen35FullAttention):
-                k_cache = torch.empty(num_blocks, block_size, attention.local_kv_heads, attention.head_dim, device=device, dtype=self.config.dtype)
-                v_cache = torch.empty(num_blocks, block_size, attention.local_kv_heads, attention.head_dim, device=device, dtype=self.config.dtype)
+                k_cache = torch.empty(
+                    num_blocks,
+                    block_size,
+                    attention.local_kv_heads,
+                    attention.head_dim,
+                    device=device,
+                    dtype=self.config.dtype,
+                )
+                v_cache = torch.empty(
+                    num_blocks,
+                    block_size,
+                    attention.local_kv_heads,
+                    attention.head_dim,
+                    device=device,
+                    dtype=self.config.dtype,
+                )
                 caches.append((k_cache, v_cache))
         return caches
 
@@ -734,13 +812,21 @@ class Qwen35Adapter(ModelAdapter):
 
     def match_hf_config(self, hf_config: dict[str, Any]) -> bool:
         architectures = set(hf_config.get("architectures") or [])
-        return str(hf_config.get("model_type", "")).lower() == "qwen3_5" or "Qwen3_5ForConditionalGeneration" in architectures
+        return (
+            str(hf_config.get("model_type", "")).lower() == "qwen3_5"
+            or "Qwen3_5ForConditionalGeneration" in architectures
+        )
 
     def config_from_hf(self, hf_config: dict[str, Any]) -> ModelConfig:
         text = hf_config.get("text_config") or hf_config
-        dtype = _parse_dtype(text.get("torch_dtype") or text.get("dtype") or hf_config.get("torch_dtype") or hf_config.get("dtype"))
+        dtype = _parse_dtype(
+            text.get("torch_dtype") or text.get("dtype") or hf_config.get("torch_dtype") or hf_config.get("dtype")
+        )
         rope = text.get("rope_parameters") or text.get("rope_scaling") or {}
-        layer_types = tuple(text.get("layer_types") or _layer_types_from_interval(int(text["num_hidden_layers"]), int(text.get("full_attention_interval", 1))))
+        layer_types = tuple(
+            text.get("layer_types")
+            or _layer_types_from_interval(int(text["num_hidden_layers"]), int(text.get("full_attention_interval", 1)))
+        )
         return ModelConfig(
             model_type=self.name,
             checkpoint_prefix="model",
@@ -795,19 +881,31 @@ class Qwen35MoeAdapter(ModelAdapter):
 
     def match_hf_config(self, hf_config: dict[str, Any]) -> bool:
         architectures = set(hf_config.get("architectures") or [])
-        return str(hf_config.get("model_type", "")).lower() == "qwen3_5_moe" or "Qwen3_5MoeForConditionalGeneration" in architectures
+        return (
+            str(hf_config.get("model_type", "")).lower() == "qwen3_5_moe"
+            or "Qwen3_5MoeForConditionalGeneration" in architectures
+        )
 
     def config_from_hf(self, hf_config: dict[str, Any]) -> ModelConfig:
         text = hf_config.get("text_config") or hf_config
-        dtype = _parse_dtype(text.get("torch_dtype") or text.get("dtype") or hf_config.get("torch_dtype") or hf_config.get("dtype"))
+        dtype = _parse_dtype(
+            text.get("torch_dtype") or text.get("dtype") or hf_config.get("torch_dtype") or hf_config.get("dtype")
+        )
         rope = text.get("rope_parameters") or text.get("rope_scaling") or {}
-        layer_types = tuple(text.get("layer_types") or _layer_types_from_interval(int(text["num_hidden_layers"]), int(text.get("full_attention_interval", 1))))
+        layer_types = tuple(
+            text.get("layer_types")
+            or _layer_types_from_interval(int(text["num_hidden_layers"]), int(text.get("full_attention_interval", 1)))
+        )
         return ModelConfig(
             model_type=self.name,
             checkpoint_prefix="model",
             vocab_size=int(text["vocab_size"]),
             hidden_size=int(text["hidden_size"]),
-            intermediate_size=int(text.get("intermediate_size", text.get("shared_expert_intermediate_size", text["moe_intermediate_size"]))),
+            intermediate_size=int(
+                text.get(
+                    "intermediate_size", text.get("shared_expert_intermediate_size", text["moe_intermediate_size"])
+                )
+            ),
             num_hidden_layers=int(text["num_hidden_layers"]),
             num_attention_heads=int(text["num_attention_heads"]),
             num_key_value_heads=int(text.get("num_key_value_heads", text["num_attention_heads"])),
@@ -861,7 +959,10 @@ class Qwen35MoeAdapter(ModelAdapter):
 def _layer_types_from_interval(num_layers: int, full_attention_interval: int) -> list[str]:
     if full_attention_interval <= 0:
         raise ValueError("full_attention_interval must be positive")
-    return ["full_attention" if (idx + 1) % full_attention_interval == 0 else "linear_attention" for idx in range(num_layers)]
+    return [
+        "full_attention" if (idx + 1) % full_attention_interval == 0 else "linear_attention"
+        for idx in range(num_layers)
+    ]
 
 
 @torch._dynamo.disable
@@ -870,7 +971,9 @@ def _areno_linear_no_compile(x: torch.Tensor, weight: torch.Tensor) -> torch.Ten
 
 
 @torch._dynamo.disable
-def _areno_topk_softmax_no_compile(logits: torch.Tensor, top_k: int, renormalize: bool) -> tuple[torch.Tensor, torch.Tensor]:
+def _areno_topk_softmax_no_compile(
+    logits: torch.Tensor, top_k: int, renormalize: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
     return areno_topk_softmax(logits, top_k, renormalize)
 
 

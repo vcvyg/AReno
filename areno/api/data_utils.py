@@ -27,14 +27,18 @@ def encode_prompt_value(tokenizer, prompt) -> list[int]:
     return encode_generation_prompt(tokenizer, prompt)
 
 
-def prompt_response_to_tokens_and_mask(prompt: str, response: str, tokenizer, eos_token_id: int) -> tuple[list[int], list[bool]]:
+def prompt_response_to_tokens_and_mask(
+    prompt: str, response: str, tokenizer, eos_token_id: int
+) -> tuple[list[int], list[bool]]:
     """Encode prompt text plus response text and mask the prompt prefix."""
 
     prompt_ids = encode_generation_prompt(tokenizer, prompt)
     return response_to_tokens_and_mask(prompt_ids, response, tokenizer, eos_token_id)
 
 
-def response_to_tokens_and_mask(prompt_ids: list[int], response: str, tokenizer, eos_token_id: int) -> tuple[list[int], list[bool]]:
+def response_to_tokens_and_mask(
+    prompt_ids: list[int], response: str, tokenizer, eos_token_id: int
+) -> tuple[list[int], list[bool]]:
     """Append a response to pre-tokenized prompt ids and mask prompt tokens."""
 
     response_ids = tokenizer.encode(response, add_special_tokens=False)

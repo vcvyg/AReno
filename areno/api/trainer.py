@@ -11,15 +11,15 @@ import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from areno.api.agentic import LossMaskPolicy, RolloutSession
+from areno.api.backend.base import Backend, get_backend_cls
 from areno.api.config import BackendConfig, coerce_backend_config, resolve_backend_type
 from areno.api.context import Context
 from areno.api.data import PromptBatch, PromptItem
-from areno.api.agentic import LossMaskPolicy, RolloutSession
 from areno.api.metrics import MetricsRecorder
-from areno.api.tokenizer import encode_generation_prompt, eos_token_ids, load_tokenizer
-from areno.api.backend.base import Backend, get_backend_cls
-from areno.api.models import SamplingParams, RolloutResult, TrainSequence, BackendType
+from areno.api.models import BackendType, RolloutResult, SamplingParams, TrainSequence
 from areno.api.roles import ModelRole
+from areno.api.tokenizer import encode_generation_prompt, eos_token_ids, load_tokenizer
 
 
 class Trainer:
@@ -30,6 +30,7 @@ class Trainer:
     `init()`, repeatedly runs `rollout_batch() -> train()`, and finally
     `close()`.
     """
+
     def __init__(
         self,
         world_size: int,
@@ -67,7 +68,9 @@ class Trainer:
 
         real_path = self._model_path
         self._tokenizer = load_tokenizer(real_path)
-        self._ctx = Context(self._world_size, real_path, self._tokenizer, self._custom_config, eos_token_ids(real_path, self._tokenizer))
+        self._ctx = Context(
+            self._world_size, real_path, self._tokenizer, self._custom_config, eos_token_ids(real_path, self._tokenizer)
+        )
         backend_cls = get_backend_cls(self._backend_type)
         if backend_cls is None:
             raise ValueError(f"unsupported backend type: {self._backend_type}")
@@ -126,7 +129,9 @@ class Trainer:
         if self._backend is None or self._ctx is None:
             raise RuntimeError("Trainer is not initialized")
         if self._rollout_session_depth <= 0:
-            raise RuntimeError("sync_rollout_session_async must be called inside `async with trainer.rollout_session(...)`")
+            raise RuntimeError(
+                "sync_rollout_session_async must be called inside `async with trainer.rollout_session(...)`"
+            )
         await self._backend.sync_rollout_session_async(self._ctx)
 
     def dp_size(self) -> int:
@@ -182,7 +187,9 @@ class Trainer:
 
         if self._rollout_wall_start is None:
             return
-        self._metric_timings["rollout"] = self._metric_timings.get("rollout", 0.0) + time.perf_counter() - self._rollout_wall_start
+        self._metric_timings["rollout"] = (
+            self._metric_timings.get("rollout", 0.0) + time.perf_counter() - self._rollout_wall_start
+        )
         self._rollout_wall_start = None
 
     def load_prompt_batches(
@@ -216,7 +223,9 @@ class Trainer:
                 cursor += 1
                 scanned += 1
                 if prompt_key not in record:
-                    raise ValueError(f"dataset row must contain `{prompt_key}`; use --dataset-loader-fn to normalize raw rows")
+                    raise ValueError(
+                        f"dataset row must contain `{prompt_key}`; use --dataset-loader-fn to normalize raw rows"
+                    )
                 prompt = record[prompt_key]
                 input_tokens = encode_generation_prompt(self._tokenizer, prompt)
                 if len(input_tokens) > max_prompt_tokens:
@@ -270,7 +279,9 @@ class Trainer:
         """Async rollout variant for request-concurrent callers."""
 
         if self._rollout_session_depth <= 0:
-            raise RuntimeError("rollout_token_batch_async must be called inside `async with trainer.rollout_session(...)`")
+            raise RuntimeError(
+                "rollout_token_batch_async must be called inside `async with trainer.rollout_session(...)`"
+            )
         self._begin_step()
         rollout_async = getattr(self._backend, "rollout_batch_async")
         return await rollout_async(self._ctx, prompt_tokens, n_samples, sampling_params)

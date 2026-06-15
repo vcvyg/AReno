@@ -12,7 +12,6 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from areno.engine.runtime.common import ceil_div
 from areno.engine.runtime.metadata import InferMeta
 
 
@@ -36,7 +35,9 @@ def sync_before_graph_capture(device: torch.device, group) -> None:
         torch.cuda.synchronize(device)
     if dist.is_available() and dist.is_initialized():
         if device.type == "cuda":
-            dist.barrier(group=group, device_ids=[device.index if device.index is not None else torch.cuda.current_device()])
+            dist.barrier(
+                group=group, device_ids=[device.index if device.index is not None else torch.cuda.current_device()]
+            )
         else:
             dist.barrier(group=group)
     if device.type == "cuda":
@@ -130,7 +131,9 @@ class DecodeGraph:
         # and must remain alive at the same addresses for the lifetime of the
         # graph, which is exactly what `self.input_ids/...` provide.
         with torch.cuda.device(self.device), torch.cuda.graph(self.graph):
-            self.logits_shard = self.model(input_ids=self.input_ids, position_ids=self.position_ids, infer_meta=self.meta).logits_shard
+            self.logits_shard = self.model(
+                input_ids=self.input_ids, position_ids=self.position_ids, infer_meta=self.meta
+            ).logits_shard
 
     @torch.inference_mode()
     def replay_tensors(
@@ -153,7 +156,9 @@ class DecodeGraph:
         self.cache_seqlens[:actual].copy_(cache_seqlens)
         block_cols = int(block_table.shape[1])
         if block_cols > self.block_table.shape[1]:
-            raise ValueError(f"decode block table has {block_cols} columns, graph buffer has {self.block_table.shape[1]}")
+            raise ValueError(
+                f"decode block table has {block_cols} columns, graph buffer has {self.block_table.shape[1]}"
+            )
         self.block_table[:actual, :block_cols].copy_(block_table)
         if block_cols < self.block_table.shape[1]:
             # Pad the unused columns to scratch so attention reads stay valid.
@@ -162,10 +167,10 @@ class DecodeGraph:
         # Fill the unused tail rows with no-op values so the captured kernel
         # runs over the full bucket without touching live KV cache slots.
         if actual < self.bucket:
-            self.input_ids[0, actual:self.bucket].fill_(0)
-            self.position_ids[0, actual:self.bucket].fill_(0)
-            self.block_table[actual:self.bucket].fill_(self.scratch_block)
-            self.cache_seqlens[actual:self.bucket].fill_(0)
+            self.input_ids[0, actual : self.bucket].fill_(0)
+            self.position_ids[0, actual : self.bucket].fill_(0)
+            self.block_table[actual : self.bucket].fill_(self.scratch_block)
+            self.cache_seqlens[actual : self.bucket].fill_(0)
 
         self.graph.replay()
         assert self.logits_shard is not None

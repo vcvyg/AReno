@@ -69,7 +69,9 @@ class TrainerDatasetUtilityTest(unittest.TestCase):
         """DPO rows are emitted as chosen then rejected with shared prompt masks."""
         tokenizer = FakeTextTokenizer()
 
-        pair = dpo_mod._record_to_train_pair({"prompt": "q", "chosen": "good", "rejected": "bad"}, tokenizer, max_seq_len=32)
+        pair = dpo_mod._record_to_train_pair(
+            {"prompt": "q", "chosen": "good", "rejected": "bad"}, tokenizer, max_seq_len=32
+        )
 
         self.assertEqual(len(pair), 2)
         self.assertEqual(pair[0].eos_token_id, 99)

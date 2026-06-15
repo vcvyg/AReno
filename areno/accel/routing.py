@@ -9,6 +9,7 @@ total length so launch parameters can be sized correctly. The kernel writes
 into caller-allocated buffers in place; ``cumsum_buffer`` provides scratch
 space for the prefix-sum step and must be supplied.
 """
+
 import torch
 
 from areno.accel._extension import extension as _extension

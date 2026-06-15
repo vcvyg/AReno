@@ -5,9 +5,9 @@ import unittest
 import torch
 
 from areno.api.advantages import _compute_gae_python
-from areno.api.rewards import compute_group_advantages
 from areno.api.loss_fns.grpo import grpo_loss_fn
 from areno.api.loss_fns.ppo import _kl_penalty, ppo_loss_fn
+from areno.api.rewards import compute_group_advantages
 
 
 class AdvantageAndRewardTest(unittest.TestCase):

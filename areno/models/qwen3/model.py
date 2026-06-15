@@ -15,27 +15,34 @@ The architecture is a vanilla GQA decoder:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import torch
-from areno.accel import areno_grouped_linear, areno_linear, areno_moe_topk_permute, areno_moe_unpermute, areno_topk_softmax
 from torch import nn
 
-from areno.engine.runtime.metadata import InferMeta, TrainMeta
+from areno.accel import (
+    areno_grouped_linear,
+    areno_linear,
+    areno_moe_topk_permute,
+    areno_moe_unpermute,
+    areno_topk_softmax,
+)
+from areno.accel.ops import FusedMoeConfig, areno_fused_experts, areno_silu_and_mul, log_once
 from areno.engine.checkpoints.common import load_checkpoint_weights, save_checkpoint_weights
-from areno.models.qwen3.checkpoint import CHECKPOINT_SPEC, QWEN3_MOE_CHECKPOINT_SPEC
 from areno.engine.config import ModelConfig, _parse_dtype
-from areno.engine.layers.vocab import VocabParallelEmbedding, VocabParallelLMHead
-from areno.engine.parallel.collectives import all_reduce, scatter_to_sequence_parallel_region, sequence_parallel_region
 from areno.engine.layers.attention import CausalSelfAttention
+from areno.engine.layers.linear import mark_tensor_parallel_parameter
 from areno.engine.layers.mlp import GatedMLP
 from areno.engine.layers.norm import RMSNorm
-from areno.engine.layers.linear import mark_tensor_parallel_parameter
-from areno.models.base import CausalLMOutput, ModelAdapter
-from areno.accel.ops import FusedMoeConfig, areno_silu_and_mul, areno_fused_experts, log_once
-from areno.engine.runtime.recompute import checkpoint_layer
+from areno.engine.layers.vocab import VocabParallelEmbedding, VocabParallelLMHead
+from areno.engine.parallel.collectives import all_reduce, scatter_to_sequence_parallel_region, sequence_parallel_region
 from areno.engine.parallel.context import get_tp_context
+from areno.engine.runtime.metadata import InferMeta, TrainMeta
+from areno.engine.runtime.recompute import checkpoint_layer
+from areno.models.base import CausalLMOutput, ModelAdapter
+from areno.models.qwen3.checkpoint import CHECKPOINT_SPEC, QWEN3_MOE_CHECKPOINT_SPEC
 
 
 class QwenDecoderLayer(nn.Module):
@@ -101,7 +108,9 @@ class Qwen3MoeExperts(nn.Module):
             return all_reduce(flat.new_zeros(flat.shape))
         hidden = _areno_grouped_linear_no_compile(x.contiguous(), self.gate_up_weight, tokens_per_expert)
         log_once("qwen3_moe_silu_and_mul", "using ARENO fused silu_and_mul kernel for Qwen3-MoE experts")
-        hidden = (_areno_silu_and_mul_no_compile(hidden) * route_weight.unsqueeze(-1).to(dtype=hidden.dtype)).contiguous()
+        hidden = (
+            _areno_silu_and_mul_no_compile(hidden) * route_weight.unsqueeze(-1).to(dtype=hidden.dtype)
+        ).contiguous()
         out = _areno_grouped_linear_no_compile(hidden, self.down_weight, tokens_per_expert)
         out = _areno_moe_unpermute_no_compile(out, token_idx, flat.shape)
         return all_reduce(out)
@@ -112,7 +121,9 @@ class Qwen3MoeExperts(nn.Module):
         return local_idx, topk_weight * local_mask.to(dtype=topk_weight.dtype)
 
     @torch.no_grad()
-    def copy_expert(self, expert_id: int, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor, rank: int, world_size: int) -> None:
+    def copy_expert(
+        self, expert_id: int, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor, rank: int, world_size: int
+    ) -> None:
         del rank, world_size
         if expert_id < self.local_expert_start or expert_id >= self.local_expert_end:
             return
@@ -295,7 +306,9 @@ class Qwen3ForCausalLM(nn.Module):
         del tp_group, dp_group
         return None
 
-    def allocate_kv_caches(self, num_blocks: int, block_size: int, device: torch.device) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    def allocate_kv_caches(
+        self, num_blocks: int, block_size: int, device: torch.device
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Allocate paged KV cache tensors shaped [blocks, block_size, local_kv_heads, head_dim]."""
         caches = []
         for layer in self.layers:
@@ -490,12 +503,16 @@ def _areno_moe_topk_permute_no_compile(
 
 
 @torch._dynamo.disable
-def _areno_moe_unpermute_no_compile(expert_out: torch.Tensor, token_idx: torch.Tensor, restore_shape: tuple[int, int]) -> torch.Tensor:
+def _areno_moe_unpermute_no_compile(
+    expert_out: torch.Tensor, token_idx: torch.Tensor, restore_shape: tuple[int, int]
+) -> torch.Tensor:
     return areno_moe_unpermute(expert_out, token_idx, restore_shape)
 
 
 @torch._dynamo.disable
-def _areno_grouped_linear_no_compile(x: torch.Tensor, weight: torch.Tensor, tokens_per_expert: torch.Tensor | Sequence[int]) -> torch.Tensor:
+def _areno_grouped_linear_no_compile(
+    x: torch.Tensor, weight: torch.Tensor, tokens_per_expert: torch.Tensor | Sequence[int]
+) -> torch.Tensor:
     return areno_grouped_linear(x, weight, tokens_per_expert)
 
 
@@ -510,7 +527,9 @@ def _areno_silu_and_mul_no_compile(x: torch.Tensor) -> torch.Tensor:
 
 
 @torch._dynamo.disable
-def _areno_topk_softmax_no_compile(logits: torch.Tensor, top_k: int, renormalize: bool) -> tuple[torch.Tensor, torch.Tensor]:
+def _areno_topk_softmax_no_compile(
+    logits: torch.Tensor, top_k: int, renormalize: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
     return areno_topk_softmax(logits, top_k, renormalize)
 
 

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from areno.cli import serve as serve_mod
 from areno.api.tool_call_parser import QwenToolCallParser
+from areno.cli import serve as serve_mod
 
 
 def test_create_app_passes_eager_decode_runtime_config(monkeypatch):
@@ -43,7 +43,9 @@ def test_chat_completion_request_defaults_match_sampling_params():
 
 
 def test_serve_response_reuses_tool_call_parser():
-    tokenizer = _TokenTokenizer({1: "<tool_call>", 2: '{"name":"choose_move","arguments":{"direction":"left"}}', 3: "</tool_call>"})
+    tokenizer = _TokenTokenizer(
+        {1: "<tool_call>", 2: '{"name":"choose_move","arguments":{"direction":"left"}}', 3: "</tool_call>"}
+    )
     request = serve_mod.ChatCompletionRequest(
         model="areno",
         messages=[serve_mod.ChatMessage(role="user", content="choose")],

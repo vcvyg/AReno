@@ -6,8 +6,10 @@ re-use the extension's tuned backward. ``areno_grouped_linear`` performs
 per-expert matmuls over contiguous token groups (post-permute MoE layout)
 without launching one kernel per expert.
 """
+
+from collections.abc import Sequence
+
 import torch
-from typing import Sequence
 
 from areno.accel._extension import extension as _extension
 
@@ -80,7 +82,9 @@ class _GroupedLinearCounts(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, tokens_per_expert: torch.Tensor) -> torch.Tensor:
-        out = _extension().areno_grouped_linear_forward_counts(x.contiguous(), weight.contiguous(), tokens_per_expert.contiguous())
+        out = _extension().areno_grouped_linear_forward_counts(
+            x.contiguous(), weight.contiguous(), tokens_per_expert.contiguous()
+        )
         ctx.save_for_backward(x, weight, tokens_per_expert)
         return out
 
@@ -97,7 +101,9 @@ class _GroupedLinearCounts(torch.autograd.Function):
 
 
 @torch._dynamo.disable
-def areno_grouped_linear(x: torch.Tensor, weight: torch.Tensor, tokens_per_expert: torch.Tensor | Sequence[int]) -> torch.Tensor:
+def areno_grouped_linear(
+    x: torch.Tensor, weight: torch.Tensor, tokens_per_expert: torch.Tensor | Sequence[int]
+) -> torch.Tensor:
     """Apply per-expert linear projections to contiguous token groups.
 
     ``x`` is the permuted token matrix laid out expert-major and

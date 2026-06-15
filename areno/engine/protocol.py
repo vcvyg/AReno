@@ -10,8 +10,8 @@ request-id demux so multiple caller threads/tasks can have in-flight commands.
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import asyncio
+import multiprocessing as mp
 import queue
 import socket
 import threading
@@ -25,7 +25,7 @@ import torch
 
 from areno.engine.config import EngineConfig
 from areno.engine.data import SamplingParams
-from areno.engine.parallel.context import destroy_process_group, get_tp_context, init_process_group
+from areno.engine.parallel.context import destroy_process_group, init_process_group
 
 
 class Op(Enum):
@@ -376,7 +376,9 @@ class TPCluster:
         """Apply one worker result to a pending call and complete it if done."""
 
         if not result.ok:
-            self._finish_pending_call(request_id, pending, RuntimeError(f"rank {rank} failed during {pending.op}:\n{result.error}"))
+            self._finish_pending_call(
+                request_id, pending, RuntimeError(f"rank {rank} failed during {pending.op}:\n{result.error}")
+            )
             return
         pending.results[rank] = result.payload
         pending.pending.discard(rank)
@@ -456,7 +458,7 @@ class TPCluster:
             _close_queue(self.result_queue)
             self.started = False
 
-    def __enter__(self) -> "TPCluster":
+    def __enter__(self) -> TPCluster:
         """Start the cluster for context-manager usage."""
 
         self.start()

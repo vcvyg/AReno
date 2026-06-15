@@ -8,13 +8,12 @@ from areno.engine.checkpoints.io import SafetensorsIndex
 from areno.engine.config import EngineConfig
 from areno.engine.data import to_device
 from areno.engine.modeling import build_model_on_device, build_optimizer, canonical_model_path, param_grad, unwrap_model
-from areno.engine.protocol import EnsureRolesPayload, ScorePayload, TrainValuesPayload
-from areno.models.registry import config_from_hf, load_model_weights
 from areno.engine.optim import AdamW8bit, AdamWFP32Master
 from areno.engine.parallel.context import get_tp_context
+from areno.engine.protocol import EnsureRolesPayload, ScorePayload, TrainValuesPayload
 from areno.engine.runtime.logprobs import next_token_logprobs
 from areno.engine.runtime.train_step import _dense_train_meta
-
+from areno.models.registry import config_from_hf, load_model_weights
 
 _REWARD_HEAD_WEIGHT_KEYS = (
     "score.weight",
@@ -104,14 +103,18 @@ def _try_load_reward_head(head: torch.nn.Linear | None, path: str) -> bool:
             elif weight.T.shape == head.weight.shape:
                 head.weight.copy_(weight.T.contiguous())
             else:
-                raise ValueError(f"reward head {key} has shape {tuple(weight.shape)}, expected {tuple(head.weight.shape)}")
+                raise ValueError(
+                    f"reward head {key} has shape {tuple(weight.shape)}, expected {tuple(head.weight.shape)}"
+                )
             bias_key = _reward_head_bias_key(key)
             if head.bias is not None:
                 if bias_key not in index:
                     raise KeyError(f"reward head checkpoint is missing {bias_key}")
                 bias = index.get_tensor(bias_key).to(device=head.bias.device, dtype=head.bias.dtype).flatten()
                 if bias.shape != head.bias.shape:
-                    raise ValueError(f"reward head {bias_key} has shape {tuple(bias.shape)}, expected {tuple(head.bias.shape)}")
+                    raise ValueError(
+                        f"reward head {bias_key} has shape {tuple(bias.shape)}, expected {tuple(head.bias.shape)}"
+                    )
                 head.bias.copy_(bias)
             return True
     finally:
@@ -129,7 +132,7 @@ def _zero_init_value_head(value_head: torch.nn.Module | None) -> None:
         param.zero_()
 
 
-def accumulate_role_main_gradients(role: "WorkerRole") -> None:
+def accumulate_role_main_gradients(role: WorkerRole) -> None:
     """Fold `param.grad` into `param.main_grad` (FP32) for a role's params."""
 
     for param in role.parameters():
@@ -147,7 +150,13 @@ def accumulate_role_main_gradients(role: "WorkerRole") -> None:
 class WorkerRole:
     """A swap-in non-actor model (reference / critic / reward) on this rank."""
 
-    def __init__(self, path: str, model: torch.nn.Module, optimizer: AdamW8bit | AdamWFP32Master | None, value_head: torch.nn.Module | None):
+    def __init__(
+        self,
+        path: str,
+        model: torch.nn.Module,
+        optimizer: AdamW8bit | AdamWFP32Master | None,
+        value_head: torch.nn.Module | None,
+    ):
         self.path = path
         self.model = model
         self.optimizer = optimizer
@@ -169,7 +178,7 @@ class WorkerRole:
         devices: list[int] | None,
         optimizer_lr: float | None = None,
         source_model: torch.nn.Module | None = None,
-    ) -> "WorkerRole":
+    ) -> WorkerRole:
         """Construct a role from a HF-style checkpoint at `path`."""
 
         model_config = config_from_hf(path)
@@ -192,7 +201,11 @@ class WorkerRole:
         checkpoint_head_out = _maybe_reward_head_out_features(path) if critic else None
         head_out = _reward_head_out_features(path) if reward else checkpoint_head_out or 1
         head_bias = _reward_head_uses_bias(path) if reward or checkpoint_head_out is not None else False
-        value_head = torch.nn.Linear(model_config.hidden_size, head_out, bias=head_bias, dtype=model_config.dtype, device=device) if critic or reward else None
+        value_head = (
+            torch.nn.Linear(model_config.hidden_size, head_out, bias=head_bias, dtype=model_config.dtype, device=device)
+            if critic or reward
+            else None
+        )
         if value_head is not None:
             for param in value_head.parameters():
                 param.role_tp_average = True
@@ -340,7 +353,9 @@ class RoleManager:
         finally:
             role.offload()
 
-    def _score_value_rows(self, role: WorkerRole, token_rows: list[list[int]], payload: ScorePayload) -> list[list[float]]:
+    def _score_value_rows(
+        self, role: WorkerRole, token_rows: list[list[int]], payload: ScorePayload
+    ) -> list[list[float]]:
         """Score critic values in bounded microbatches."""
 
         local = []
@@ -418,7 +433,15 @@ class RoleManager:
         finally:
             role.offload()
 
-    def _train_value_microbatch(self, role: WorkerRole, data_pack_obj: dict, payload: TrainValuesPayload, group_size: int, allow_step: bool, stats: "_CriticStats") -> None:
+    def _train_value_microbatch(
+        self,
+        role: WorkerRole,
+        data_pack_obj: dict,
+        payload: TrainValuesPayload,
+        group_size: int,
+        allow_step: bool,
+        stats: _CriticStats,
+    ) -> None:
         """Run one critic value microbatch and maybe step optimizer."""
 
         worker = self.worker
@@ -510,7 +533,9 @@ def _mean(values: list[float]) -> float:
     return sum(values) / max(len(values), 1)
 
 
-def _pad_token_rows(token_rows: list[list[int]], device: torch.device, pad_token_id: int) -> tuple[torch.Tensor, list[int]]:
+def _pad_token_rows(
+    token_rows: list[list[int]], device: torch.device, pad_token_id: int
+) -> tuple[torch.Tensor, list[int]]:
     """Pad variable-length token rows into a `(B, max_len)` tensor."""
 
     if not token_rows:
