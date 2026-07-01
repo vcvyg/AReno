@@ -173,6 +173,8 @@ def _trainer_config_from_options(**options) -> TrainerConfig:
     if args.dataset_path is None:
         raise click.UsageError("--dataset-path is required")
     algorithm = _algorithm_for_cli(args.algo)
+    if algorithm.name == "sft" and args.dataset_loader_fn is None:
+        raise click.UsageError("--dataset-loader-fn is required for --algo sft")
     tune_params = bool(getattr(args, "tune_params", False))
     mem_frac = float(getattr(args, "mem_frac", 0.9))
     tune_max_samples = int(getattr(args, "tune_max_samples", 256))
