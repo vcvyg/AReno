@@ -233,6 +233,35 @@ See the documentation for the full `Trainer` API.
 
 You can use the AReno Command Line Interface (CLI) to quickly get started with post-training without writing any Python.
 
+### Operations agent
+
+`areno agent` is a local operations assistant for AReno train and serve tasks.
+It uses an OpenAI-compatible model to inspect the current checkout, read command
+help, run diagnostics, and produce or execute AReno commands for the current
+machine. Configure the agent once with your endpoint, model, and API key:
+
+```bash
+areno agent --set \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model deepseek-v4-flash \
+  --api-key "$OPENAI_API_KEY"
+```
+
+Then describe the job in natural language:
+
+```bash
+areno agent "Give me a complete command to run the math demo with n-samples=8, fitting the current GPU and using as much GPU memory as practical."
+```
+
+From a source checkout, you can run the same agent without installing AReno:
+
+```bash
+./agent.sh "Give me a complete command to run the math demo with n-samples=8, fitting the current GPU and using as much GPU memory as practical."
+```
+
+The agent can ask follow-up questions through the terminal when a required
+parameter is missing, and it streams command output while it works.
+
 ### Diagnostics
 
 Check whether the current machine is ready to run AReno:
@@ -283,7 +312,7 @@ areno train \
   --tp-size 4
 ```
 
-`--ckpt` and `--dataset-path` accept either local paths or remote repo IDs. By default, remote refs use Hugging Face. Add `--model-hub modelscope` to pull non-local model and dataset refs from ModelScope, or use `--model-hub hf` explicitly for Hugging Face. Switch algorithms by changing `--algo` (e.g. `--algo grpo`, `--algo sft`).
+`--ckpt` and `--dataset-path` accept either local paths or remote repo IDs. By default, remote refs use ModelScope. Use `--model-hub hf` to pull non-local model and dataset refs from Hugging Face. Switch algorithms by changing `--algo` (e.g. `--algo grpo`, `--algo sft`).
 
 For models whose tokenizer chat template supports a thinking-mode switch, add `--disable-thinking` to pass `enable_thinking=False` during training prompt rendering. Tokenizers that do not support this argument automatically use their normal chat-template path.
 

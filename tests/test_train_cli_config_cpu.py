@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from click import UsageError, unstyle
@@ -153,7 +154,7 @@ def test_train_config_builds_sft_shape_without_rollout_or_role_fields():
     assert cfg.algo == "sft"
     assert cfg.ckpt == "actor"
     assert cfg.dataset_path == "dataset"
-    assert cfg.model_hub == "hf"
+    assert cfg.model_hub == "modelscope"
     assert cfg.optimizer_min_lr == 0.0
     assert cfg.attn_backend == "native"
     assert cfg.areno_config().runtime["attn_backend"] == "native"
@@ -316,7 +317,7 @@ def test_training_config_summary_shows_resolved_values_and_warning():
     assert "requires_rollout  yes" in summary
     assert "ckpt            actor" in summary
     assert "dataset_path    dataset" in summary
-    assert "model_hub       hf" in summary
+    assert "model_hub       modelscope" in summary
     assert "reward_fn       none" in summary
     assert "reward_ckpt     reward-model" in summary
     assert "dp_size       4" in summary
@@ -487,6 +488,7 @@ def test_train_command_tunes_params_before_summary_and_run(monkeypatch):
         )
 
     monkeypatch.setattr("areno.cli.auto_tune.auto_tune_config", fake_auto_tune)
+    monkeypatch.setattr(train_cli, "resolve_model_refs_for_config", lambda config: config)
     monkeypatch.setattr(train_cli, "run", fake_run)
 
     result = CliRunner().invoke(
@@ -521,6 +523,49 @@ def test_train_command_tunes_params_before_summary_and_run(monkeypatch):
     assert "n_samples            4" in output
     assert "max_running_prompts  4" in output
     assert events == [("tune", 32, 8, 16, 0.82, 64), ("run", 1, 4, 2, 4)]
+
+
+def test_train_command_smoke_resolves_model_ref_before_probe(monkeypatch):
+    events = []
+
+    def fake_resolve(config):
+        events.append(("resolve", config.ckpt))
+        config.ckpt = "/cache/actor"
+        return config
+
+    def fake_smoke(config):
+        events.append(("smoke", config.ckpt))
+        return SimpleNamespace(
+            ok=True,
+            error=None,
+            peak_mem_frac=0.1,
+            candidate=SimpleNamespace(
+                tp_size=1,
+                batch_size=1,
+                n_samples=1,
+                mini_bs=1,
+                max_running_prompts=1,
+                adam_8bit=False,
+                keep_rollout_state=False,
+            ),
+        )
+
+    monkeypatch.setattr(train_cli, "resolve_model_refs_for_config", fake_resolve)
+    monkeypatch.setattr("areno.cli.auto_tune.smoke_infer_config", fake_smoke)
+
+    result = CliRunner().invoke(
+        train_cli.train_command,
+        [
+            "--algo",
+            "gspo",
+            "--ckpt",
+            "actor",
+            "--smoke-infer",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert events == [("resolve", "actor"), ("smoke", "/cache/actor")]
 
 
 EXPECTED_HELP_SECTIONS = [
@@ -586,7 +631,7 @@ def _options(**overrides):
         algo="gspo",
         ckpt="actor",
         dataset_path="dataset",
-        model_hub="hf",
+        model_hub="modelscope",
         dataset_loader_fn=None,
         reward_fn_path=None,
         save_path="save",
