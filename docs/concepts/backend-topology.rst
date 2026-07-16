@@ -32,10 +32,3 @@ One colocated engine
 ``ArenoEngine`` is implemented in ``areno/engine/api.py``. It coordinates the
 worker cluster used by both rollout and training, so the current backend does
 not split those calls across separate engines or external runtimes.
-
-Current runtime scope
----------------------
-
-This path uses AReno-owned engine code under ``areno/engine`` and AReno's CUDA
-extensions under ``areno/accel``. The supported runtime described here is the
-PyTorch and NVIDIA CUDA environment documented by the project.
