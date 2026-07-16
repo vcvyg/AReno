@@ -39,6 +39,3 @@ Current runtime scope
 This path uses AReno-owned engine code under ``areno/engine`` and AReno's CUDA
 extensions under ``areno/accel``. The supported runtime described here is the
 PyTorch and NVIDIA CUDA environment documented by the project.
-
-This note records the current implementation only. It does not imply or promise
-MLX, TPU, vLLM, SGLang, Megatron, or Ray integration.
