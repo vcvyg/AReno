@@ -440,11 +440,11 @@ class TestPromptFormatting(unittest.TestCase):
         self.assertIn("probe", prompt)
         self.assertIn("submit", prompt)
 
-    def test_prompt_says_10_turns(self):
-        """Prompt should say '10 turns', not '20 probes / 3 submissions'."""
+    def test_prompt_says_6_turns(self):
+        """Prompt should match the six-turn rollout budget."""
         circ = circuit.generate_circuit(num_inputs=3, num_gates=6, seed=42)
         prompt = circuit.format_prompt(circ)
-        self.assertIn("10 turns", prompt)
+        self.assertIn("6 turns", prompt)
         self.assertNotIn("20 probes", prompt)
         self.assertNotIn("3 submissions", prompt)
 
@@ -1240,7 +1240,7 @@ class TestRunAgentMultiTurn(unittest.TestCase):
         import run_agent  # noqa: E402
 
         item = self._make_item()
-        # 10 probe responses, no submit.
+        # More probe responses than the configured budget, with no submit.
         responses = [
             _make_response(
                 tool_calls=[
@@ -1256,5 +1256,5 @@ class TestRunAgentMultiTurn(unittest.TestCase):
         with patch("httpx.AsyncClient"), patch("openai.AsyncOpenAI", return_value=client):
             traj = asyncio.run(run_agent.run_agent(ctx, batch))
 
-        self.assertEqual(len(traj.turns), 10)
-        self.assertEqual(client.calls, 10)
+        self.assertEqual(len(traj.turns), 6)
+        self.assertEqual(client.calls, 6)

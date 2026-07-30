@@ -151,6 +151,7 @@ def _selected_logprobs_components(
     world_size: int,
     *,
     save_probs: bool,
+    vocab_chunk_size: int = 4096,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Distributed log-softmax over a vocab shard, selecting label probabilities.
 
@@ -163,19 +164,21 @@ def _selected_logprobs_components(
        SUM-reduce to combine into the full per-row target logit.
     Output is `target - logsumexp`, the selected log-softmax value.
     """
-    logits = logits_shard.float()
     labels = labels.to(device=logits_shard.device, dtype=torch.long)
-    local_vocab = logits.shape[-1]
+    local_vocab = logits_shard.shape[-1]
     local_labels = labels - int(vocab_start)
     local_mask = (local_labels >= 0) & (local_labels < local_vocab)
 
-    local_max = logits.max(dim=-1).values
+    local_max = logits_shard.max(dim=-1).values.float()
     global_max = local_max.clone()
     if world_size > 1:
         dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=group)
 
-    exp_logits = torch.exp(logits - global_max.unsqueeze(-1))
-    exp_sum = exp_logits.sum(dim=-1)
+    exp_sum = torch.zeros_like(global_max, dtype=torch.float32)
+    for start in range(0, local_vocab, vocab_chunk_size):
+        end = min(start + vocab_chunk_size, local_vocab)
+        exp_chunk = torch.exp(logits_shard[..., start:end].float() - global_max.unsqueeze(-1))
+        exp_sum += exp_chunk.sum(dim=-1)
     if world_size > 1:
         dist.all_reduce(exp_sum, op=dist.ReduceOp.SUM, group=group)
     logsumexp = global_max + exp_sum.log()
@@ -184,11 +187,18 @@ def _selected_logprobs_components(
     # resulting target value is zeroed via `local_mask` so the SUM-reduce
     # picks the correct rank's contribution.
     safe_labels = local_labels.clamp(min=0, max=max(local_vocab - 1, 0))
-    target = logits.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+    target = logits_shard.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1).float()
     target = target.masked_fill(~local_mask, 0.0)
     if world_size > 1:
         dist.all_reduce(target, op=dist.ReduceOp.SUM, group=group)
-    probs = exp_logits / exp_sum.unsqueeze(-1) if save_probs else None
+    probs = torch.empty_like(logits_shard) if save_probs else None
+    if probs is not None:
+        for start in range(0, local_vocab, vocab_chunk_size):
+            end = min(start + vocab_chunk_size, local_vocab)
+            probs[..., start:end] = (
+                torch.exp(logits_shard[..., start:end].float() - global_max.unsqueeze(-1))
+                / exp_sum.unsqueeze(-1)
+            ).to(dtype=logits_shard.dtype)
     return target - logsumexp, probs, safe_labels, local_mask
 
 

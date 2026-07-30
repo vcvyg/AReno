@@ -122,6 +122,41 @@ class LogprobTest(unittest.TestCase):
         self.assertTrue(exp_widths)
         self.assertLessEqual(max(exp_widths), 2)
 
+    def test_training_selected_logprobs_chunks_vocab_exp(self):
+        """Training forward should also bound temporary float32 vocab width."""
+        logits = torch.tensor(
+            [
+                [1.0, 2.0, -1.0, 0.25, 0.75],
+                [0.5, -0.25, 0.0, 3.0, -2.0],
+            ],
+            requires_grad=True,
+        )
+        labels = torch.tensor([1, 3])
+        expected = torch.log_softmax(logits, dim=-1).gather(-1, labels[:, None]).squeeze(-1)
+        exp_widths = []
+        real_exp = torch.exp
+
+        def tracked_exp(value):
+            exp_widths.append(value.shape[-1])
+            return real_exp(value)
+
+        with patch.object(logprob_ops.torch, "exp", side_effect=tracked_exp):
+            actual, probs, _, _ = logprob_ops._selected_logprobs_components(
+                logits,
+                labels,
+                vocab_start=0,
+                group=None,
+                world_size=1,
+                save_probs=True,
+                vocab_chunk_size=2,
+            )
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+        self.assertIsNotNone(probs)
+        self.assertEqual(probs.dtype, logits.dtype)
+        self.assertTrue(exp_widths)
+        self.assertLessEqual(max(exp_widths), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

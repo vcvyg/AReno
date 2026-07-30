@@ -4,7 +4,7 @@ The agent interacts with a faulty logic circuit through two tools:
 - ``probe``: Set input values and inspect a wire's output.
 - ``submit``: Submit the guessed faulty gate ID.
 
-Multi-turn conversation (max 10 turns):
+Multi-turn conversation (max 6 turns):
 1. Model receives circuit description.
 2. Model calls probe → executed on faulty circuit → result returned as tool message.
 3. Model calls submit → conversation ends.
@@ -32,7 +32,7 @@ import circuit  # noqa: E402
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-MAX_TURNS = 10
+MAX_TURNS = 6
 MODEL_QUERY_RETRIES = 5
 MODEL_QUERY_BACKOFF_S = 1.0
 
@@ -42,7 +42,7 @@ SYSTEM_PROMPT = (
     "Use the 'probe' tool to set inputs and inspect wire outputs. "
     "Compare observed outputs against expected logic to narrow down the fault. "
     "When you have identified the faulty gate, use the 'submit' tool. "
-    "You have at most 10 turns. Call exactly one tool per turn."
+    "You have at most 6 turns. Call exactly one tool per turn."
 )
 
 PROBE_TOOL = {

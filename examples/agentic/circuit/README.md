@@ -11,7 +11,7 @@ hidden `stuck_at_0` or `stuck_at_1` fault on a non-input gate. The model sees
 the gate types and connectivity, but never the reference outputs, faulty gate,
 fault type, or a caller-provided prompt.
 
-The agent has at most 10 turns and may call one tool per turn:
+The agent has at most 6 turns and may call one tool per turn:
 
 - `probe(inputs, wire_id)` sets the complete Boolean input vector and returns
   the selected faulty-circuit wire value.
